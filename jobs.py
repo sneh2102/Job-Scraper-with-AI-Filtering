@@ -30,7 +30,7 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.width", None)
 logging.basicConfig(level=logging.INFO)
 
-excel_file = "Sneh_Data_1_Jobs.xlsx"
+excel_file = "jobs.xlsx"
 
 PERSONAL_JOB_FINDER_PROMPT = """
 You are my Personal IT Job Finder & Evaluator.
