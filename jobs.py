@@ -355,7 +355,7 @@ def main():
     resume_text = load_resume_text(os.getenv("RESUME_PATH", "instructions.txt"))
 
     # Better default model for balanced reasoning on 4GB VRAM (with CPU spill if needed)
-    assistant = OllamaAssistant(model=os.getenv("model", "llama3.1:8b-instruct-q4_K_M"))
+    assistant = OllamaAssistant(model=os.getenv("model", "gemma3:4b"))
     logging.info(f"Ollama Assistant ready using model: {assistant.model}")
 
     new_df = scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text)
