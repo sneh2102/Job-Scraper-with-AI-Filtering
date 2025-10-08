@@ -29,9 +29,9 @@ This project enables you to scrape job postings from LinkedIn, Glassdoor, Indeed
     - Paste your resume in resume.txt
 
 
-5. **Write Instructions for the AI:**
-    - Write your criteria or preferences for the AI in the `instructions.txt` file.
-    - An example is provided in the `instructions-example.txt` file.
+5. **Write Prompt for the AI:**
+    - Write your criteria or preferences for the AI in the `PERSONAL_JOB_FINDER_PROMPT` varialbe in jobs.py file .
+    - An example is provided in the jobs.py file.
 
 ## Usage
 
