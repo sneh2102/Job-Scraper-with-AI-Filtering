@@ -24,7 +24,7 @@ This project enables you to scrape job postings from LinkedIn, Glassdoor, Indeed
     ollama serve
     ```
 4. **Create a `.env` and `resume.txt` file:**
-    - Use the `.env-example` file provided as a template.
+    - Use the `.env.example` file provided as a template.
     - Replace the placeholders with your actual values.
     - Paste your resume in resume.txt
 
