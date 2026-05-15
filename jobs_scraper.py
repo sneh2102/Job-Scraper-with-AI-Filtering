@@ -1,67 +1,62 @@
 # jobs_scraper.py
+import sys
+import os
 import logging
+
+# ── Use local jobspy (with all custom fixes) ──────────────────
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 from jobspy import scrape_jobs
-try:
-    # Newer jobspy exposes Site enum here; if not, this import may fail (we handle below)
-    from jobspy import Site
-except Exception:
-    Site = None  # fallback when enum isn't exposed
 
-def _normalize_sites(site_name):
-    """
-    Accepts comma-delimited string or list, returns list of valid site names
-    for the installed jobspy version. Unknown sites are dropped with a warning.
-    """
+def scrape_all_jobs(
+    site_name,
+    search_term,
+    location,
+    hours_old,
+    results_wanted,
+    offset=0,
+    google_search_term=None,
+    country_indeed="canada",
+    is_remote=False,
+):
+    # Normalize sites
     if isinstance(site_name, str):
-        raw = [s.strip() for s in site_name.split(",") if s.strip()]
+        sites = [s.strip().lower() for s in site_name.split(",") if s.strip()]
     elif isinstance(site_name, list):
-        raw = [str(s).strip() for s in site_name if str(s).strip()]
+        sites = [str(s).strip().lower() for s in site_name]
     else:
-        raw = []
+        sites = ["indeed", "glassdoor", "jobright"]
 
-    # default to all commonly supported on many versions if nothing provided
-    if not raw:
-        raw = ["indeed", "linkedin", "zip_recruiter", "glassdoor", "naukri", "bayt", "bdjobs"]  # omit 'google' by default
+    if not sites:
+        sites = ["indeed", "glassdoor", "jobright"]
 
-    # If enum available, filter by it; otherwise return raw (best effort)
-    if Site is not None:
-        supported = {m.name.lower() for m in Site}  # enum member names
-        valid = []
-        dropped = []
-        for s in raw:
-            s_up = s.replace("-", "_").lower()
-            if s_up in supported:
-                valid.append(s_up)
-            else:
-                dropped.append(s)
-        if dropped:
-            logging.warning("Dropping unsupported sites for this jobspy build: %s", ", ".join(dropped))
-        if not valid:
-            logging.warning("No valid sites left; falling back to ['indeed','linkedin','zip_recruiter']")
-            valid = ["indeed", "linkedin", "zip_recruiter"]
-        return valid
-    else:
-        # No enum available; best effort (and avoid 'google' which is known to break on some versions)
-        if "google" in raw:
-            logging.warning("Dropping 'google' (not supported on this jobspy version).")
-            raw = [s for s in raw if s.lower() != "google"]
-        return raw
+    # Remove unsupported sites
+    supported = {"indeed", "glassdoor", "linkedin", "zip_recruiter",
+                 "google", "jobright", "naukri", "bayt", "bdjobs"}
+    valid_sites = [s for s in sites if s in supported]
+    dropped = [s for s in sites if s not in supported]
+    if dropped:
+        logging.warning("Dropping unsupported sites: %s", dropped)
+    if not valid_sites:
+        valid_sites = ["indeed", "glassdoor"]
 
-def scrape_all_jobs(site_name, search_term, location, hours_old, results_wanted, offset=0,
-                    google_search_term=None, country_indeed="India"):
-    site_list = _normalize_sites(site_name)
+    logging.info(
+        "Scraping %s | search='%s' | location='%s' | country='%s' | hours_old=%s",
+        valid_sites, search_term, location, country_indeed, hours_old
+    )
 
-    # IMPORTANT: do NOT hardcode sites here; use the validated site_list
     return scrape_jobs(
-        site_name=site_list,
+        site_name=valid_sites,
         search_term=search_term,
-        google_search_term=google_search_term,  # Only used if 'google' supported
+        google_search_term=google_search_term,
         location=location,
-        distance=1000,
-        results_wanted=int(results_wanted) if results_wanted else 50,
+        distance=100,
+        is_remote=is_remote,
+        results_wanted=int(results_wanted) if results_wanted else 20,
         offset=int(offset) if offset else 0,
         hours_old=int(hours_old) if hours_old else 72,
         country_indeed=country_indeed,
         linkedin_fetch_description=True,
-        # proxies=[...]
+        description_format="markdown",
+        verbose=1,
     )

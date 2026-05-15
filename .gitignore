@@ -2,3 +2,12 @@
 .env
 venv/
 __pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+*.xlsx
+*.csv
+outputs/
+credentials.json
