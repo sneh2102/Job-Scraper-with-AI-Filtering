@@ -10,7 +10,7 @@ from agents.api_client import RotatingOllamaClient
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════
-# SYSTEM PROMPT — hardcoded, enforces JSON output contract
+# SYSTEM PROMPT
 # ══════════════════════════════════════════════════════════════
 
 _SYSTEM_PROMPT = """You are a Fortune 500 ATS system. Score the resume against the job description.
@@ -35,23 +35,18 @@ OUTPUT FORMAT:
 }
 
 SCORING RULES:
-- Keyword Coverage 40pts: technical JD keywords found in resume (equivalents count)
-  Postgres=SQL, React=Frontend, AWS=GCP, Docker=containers, K8s=orchestration
+- Keyword Coverage 40pts: JD keywords in resume (equivalents count)
+  Postgres=SQL, React=Frontend, AWS=GCP, Docker=containers
 - Experience Alignment 25pts: max 8pt deduction for 3yr vs 5yr gap only
-- Skills Section 20pts: skill categories mirror JD technical domains
+- Skills Section 20pts: categories mirror JD domains
 - Impact/Metrics 15pts: quantified bullets score higher
-
-IMPORTANT:
-- Only count TECHNICAL skills as missing keywords — ignore soft skills, mission statements,
-  company values (e.g. "Professional Networking", "Economic Opportunity" are NOT missing keywords)
-- sections_to_rewrite: only include sections scoring below 75
-- feedback fields: plain English ONLY, no LaTeX, no backslashes"""
+- Only TECHNICAL skills as missing_keywords — ignore soft skills, mission statements"""
 
 # ══════════════════════════════════════════════════════════════
 # DEFAULT USER PROMPT
 # ══════════════════════════════════════════════════════════════
 
-_DEFAULT_USER_PROMPT = """Score this resume against the job. Pass = 85+.
+_DEFAULT_USER_PROMPT = """Score this resume. Pass = 85+.
 
 JOB TITLE: {title}
 
@@ -62,13 +57,8 @@ RESUME (plain text):
 {latex}
 
 Focus ONLY on technical skills when listing missing_keywords.
-Ignore soft skills and company mission statements.
 Return ONLY the JSON object."""
 
-
-# ══════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════
 
 def _load_ats_prompt() -> str:
     config_path = os.path.join(
@@ -87,12 +77,11 @@ def _load_ats_prompt() -> str:
     return _DEFAULT_USER_PROMPT
 
 
+# ══════════════════════════════════════════════════════════════
+# SMART TRIM — keeps all sections, limits bullets per role
+# ══════════════════════════════════════════════════════════════
+
 def _smart_trim(text: str) -> str:
-    """
-    Keep all section headers and first 3 bullets per role/project.
-    Ensures ALL sections (including Projects) are always included.
-    Never cuts off at a fixed character limit.
-    """
     lines        = text.split("\n")
     result       = []
     bullet_count = 0
@@ -106,7 +95,7 @@ def _smart_trim(text: str) -> str:
             bullet_count = 0
             continue
 
-        # Keep role/project headings (e.g. "Nova Scotia Health, Support Consultant (Feb 2026)")
+        # Keep role/project headings
         if stripped.startswith("Project:") or (
             len(stripped) < 120 and
             "," in stripped and
@@ -124,18 +113,14 @@ def _smart_trim(text: str) -> str:
             bullet_count += 1
             continue
 
-        # Keep everything else (skills lines, empty lines, etc.)
         if stripped:
             result.append(line)
         elif result and result[-1] != "":
-            result.append("")  # preserve paragraph breaks
+            result.append("")
 
     trimmed = "\n".join(result)
-
-    # Safety limit
     if len(trimmed) > 5000:
         trimmed = trimmed[:5000] + "\n... [trimmed]"
-
     return trimmed
 
 
@@ -149,82 +134,79 @@ class ATSCheckerAgent:
 
     def check(self, title: str, description: str, latex: str) -> dict:
         logger.info("ATS checker: scoring resume for '%s'", title)
+        try:
+            user_prompt  = _load_ats_prompt()
+            plain_resume = self._latex_to_text(latex)
+            desc_trimmed = description[:1200] if len(description) > 1200 else description
 
-        plain_resume = self._latex_to_text(latex)
-        desc_trimmed = description[:1200] if len(description) > 1200 else description
-        user_prompt  = _load_ats_prompt()
+            logger.info("ATS input — resume: %d chars | desc: %d chars",
+                        len(plain_resume), len(desc_trimmed))
 
-        # Safe string replacement — never breaks on JSON braces in prompt
-        formatted_user = (
-            user_prompt
-            .replace("{title}",       str(title))
-            .replace("{description}", str(desc_trimmed))
-            .replace("{latex}",       str(plain_resume))
-        )
+            # Safe replacement — never breaks on JSON braces in prompt
+            formatted_user = (
+                user_prompt
+                .replace("{title}",       str(title))
+                .replace("{description}", str(desc_trimmed))
+                .replace("{latex}",       str(plain_resume))
+            )
 
-        logger.info("ATS input sizes — resume: %d chars | desc: %d chars",
-                    len(plain_resume), len(desc_trimmed))
+            # Retry loop — 3 attempts with backoff
+            for attempt in range(1, 4):
+                try:
+                    if attempt > 1:
+                        wait = attempt * 2
+                        logger.info("ATS retry %d/3 — waiting %ds...", attempt, wait)
+                        time.sleep(wait)
+                    else:
+                        time.sleep(0.3)
 
-        # ── Retry loop — 3 attempts with backoff ─────────────
-        for attempt in range(1, 4):
-            try:
-                if attempt > 1:
-                    wait = attempt * 2
-                    logger.info("ATS retry %d/3 — waiting %ds...", attempt, wait)
-                    time.sleep(wait)
-                else:
-                    time.sleep(0.3)
+                    response = self._direct_http(
+                        system=_SYSTEM_PROMPT,
+                        user=formatted_user,
+                        api_key=self.client.api_keys[self.client.current_index],
+                        model=self.client.model,
+                    )
 
-                response = self._direct_http(
-                    system=_SYSTEM_PROMPT,
-                    user=formatted_user,
-                    api_key=self.client.api_keys[self.client.current_index],
-                    model=self.client.model,
-                )
+                    logger.info("ATS raw response [%d chars]: %s",
+                                len(response), response[:150])
 
-                logger.info("ATS raw response [%d chars]: %s",
-                            len(response), response[:150])
+                    if not response or len(response.strip()) < 10:
+                        logger.warning("ATS attempt %d: empty response", attempt)
+                        continue
 
-                if not response or len(response.strip()) < 10:
-                    logger.warning("ATS attempt %d: empty/short response", attempt)
-                    continue
+                    stripped = response.strip()
+                    if "{" not in stripped or "}" not in stripped:
+                        logger.warning("ATS attempt %d: no JSON found — response: %s",
+                                       attempt, stripped[:80])
+                        continue
 
-                stripped = response.strip()
-                if "{" not in stripped or "}" not in stripped:
-                    logger.warning("ATS attempt %d: no JSON found — response: %s",
-                                   attempt, stripped[:80])
-                    continue
+                    result = self._parse(response)
+                    if result["score"] > 0:
+                        logger.info("ATS attempt %d succeeded — score: %d",
+                                    attempt, result["score"])
+                        return result
 
-                result = self._parse(response)
-                if result["score"] > 0:
-                    logger.info("ATS attempt %d succeeded — score: %d",
-                                attempt, result["score"])
-                    return result
+                    logger.warning("ATS attempt %d: score=0 after parse", attempt)
 
-                logger.warning("ATS attempt %d: score=0 after parse", attempt)
+                except Exception as e:
+                    err_str = str(e)
+                    logger.warning("ATS attempt %d failed: %s", attempt, err_str[:100])
+                    if any(x in err_str.lower() for x in ["429", "401", "403", "rate"]):
+                        idx = (self.client.current_index + 1) % len(self.client.api_keys)
+                        self.client.current_index = idx
+                        self.client._build_client()
+                        logger.info("Rotated to key index %d", idx)
 
-            except Exception as e:
-                err_str = str(e)
-                logger.warning("ATS attempt %d failed: %s", attempt, err_str[:100])
+            logger.warning("ATS: all attempts failed — fallback score 70")
+            return self._fallback(70)
 
-                # Rotate key on rate limit
-                if any(x in err_str.lower() for x in ["429", "401", "403", "rate"]):
-                    idx = (self.client.current_index + 1) % len(self.client.api_keys)
-                    self.client.current_index = idx
-                    self.client._build_client()
-                    logger.info("Rotated to key index %d", idx)
+        except Exception as e:
+            logger.warning("ATS check outer error: %s — fallback 70", str(e)[:60])
+            return self._fallback(70)
 
-        logger.warning("ATS: all 3 attempts failed — fallback score 70")
-        return self._fallback(70)
-
-    # ── Direct HTTP — bypasses Ollama Python library ──────────
     def _direct_http(self, system: str, user: str,
                      api_key: str, model: str) -> str:
-        """
-        Direct requests call to Ollama API.
-        Bypasses the Ollama Python library which raises partial
-        JSON responses as exceptions for structured outputs.
-        """
+        """Direct requests call — bypasses Ollama Python library issues."""
         payload = {
             "model": model,
             "messages": [
@@ -238,7 +220,6 @@ class ATSCheckerAgent:
                 "num_ctx":     8192,
             },
         }
-
         resp = _requests.post(
             "https://ollama.com/api/chat",
             json=payload,
@@ -248,27 +229,17 @@ class ATSCheckerAgent:
             },
             timeout=90,
         )
-
         if resp.status_code != 200:
             raise Exception(f"HTTP {resp.status_code}: {resp.text[:150]}")
-
         data    = resp.json()
         content = data.get("message", {}).get("content", "")
-
         if not content:
-            raise Exception(f"Empty content in response. Keys: {list(data.keys())}")
-
+            raise Exception(f"Empty content. Keys: {list(data.keys())}")
         return content.strip()
 
-    # ── LaTeX → plain text ─────────────────────────────────────
     @staticmethod
     def _latex_to_text(latex: str) -> str:
-        """
-        Convert LaTeX resume to clean plain text.
-        Reduces ~9000 char LaTeX to ~2000 chars while preserving
-        ALL sections including Projects.
-        """
-        # Skip preamble, start from content
+        """Convert LaTeX resume to plain text. Reduces ~9000 chars to ~1500."""
         body = latex
         for marker in ["\\begin{center}", "\\section{"]:
             idx = latex.find(marker)
@@ -277,55 +248,33 @@ class ATSCheckerAgent:
                 break
 
         text = body
-
-        # Preserve content inside commands
         text = re.sub(r'\\textbf\{([^}]+)\}',    r'\1', text)
         text = re.sub(r'\\textit\{([^}]+)\}',    r'\1', text)
         text = re.sub(r'\\emph\{([^}]+)\}',      r'\1', text)
         text = re.sub(r'\\underline\{([^}]+)\}', r'\1', text)
         text = re.sub(r'\\small\{([^}]+)\}',     r'\1', text)
         text = re.sub(r'\\href\{[^}]+\}\{([^}]+)\}', r'\1', text)
-
-        # Section headers → readable markers
         text = re.sub(r'\\section\{([^}]+)\}', r'\n\n=== \1 ===\n', text)
-
-        # Resume items → bullet points
-        text = re.sub(
-            r'\\resumeItem\{((?:[^{}]|\{[^{}]*\})*)\}',
-            r'- \1', text
-        )
-
-        # Job headings → readable format
+        text = re.sub(r'\\resumeItem\{((?:[^{}]|\{[^{}]*\})*)\}', r'- \1', text)
         text = re.sub(
             r'\\resumeSubheading\{([^}]+)\}\{([^}]+)\}\{([^}]+)\}\{([^}]+)\}',
-            r'\3, \1 (\2)', text
-        )
-
-        # Project headings
+            r'\3, \1 (\2)', text)
         text = re.sub(
             r'\\resumeProjectHeading\{([^}]+)\}\{([^}]+)\}',
-            r'Project: \1 (\2)', text
-        )
-
-        # Remove all remaining LaTeX commands
+            r'Project: \1 (\2)', text)
         text = re.sub(r'\\[a-zA-Z]+\*?\{[^}]*\}', ' ', text)
         text = re.sub(r'\\[a-zA-Z]+\*?',           ' ', text)
         text = re.sub(r'\{|\}',                     ' ', text)
         text = re.sub(r'\$[^$]*\$',                 ' ', text)
         text = re.sub(r'\$|\[|\]',                  ' ', text)
-
-        # Clean whitespace
         text = re.sub(r'[ \t]+',   ' ',   text)
         text = re.sub(r'\n{3,}', '\n\n',  text)
         text = text.strip()
 
-        # Smart trim — keeps all sections, limits bullets per role
         if len(text) > 2500:
             text = _smart_trim(text)
-
         return text
 
-    # ── Fallback ──────────────────────────────────────────────
     @staticmethod
     def _fallback(score: int = 70) -> dict:
         return {
@@ -335,11 +284,7 @@ class ATSCheckerAgent:
             "total_jd_keywords":    0,
             "matched_keywords":     0,
             "missing_keywords":     [],
-            "section_scores":       {
-                "skills":     score,
-                "experience": score,
-                "projects":   score,
-            },
+            "section_scores":       {"skills": score, "experience": score, "projects": score},
             "sections_to_rewrite":  [],
             "skills_feedback":      "",
             "experience_feedback":  "",
@@ -348,45 +293,29 @@ class ATSCheckerAgent:
             "suggestions":          [],
         }
 
-    # ── JSON parser ───────────────────────────────────────────
     @staticmethod
     def _parse(text: str) -> dict:
         if not text or len(text.strip()) < 5:
             return ATSCheckerAgent._fallback(70)
-
         txt = text.strip()
-
-        # Strip markdown fences
         if "```" in txt:
             m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", txt, re.IGNORECASE)
-            if m:
-                txt = m.group(1).strip()
-
-        # Extract JSON object boundaries
+            if m: txt = m.group(1).strip()
         start = txt.find("{")
         end   = txt.rfind("}")
         if start != -1 and end > start:
             txt = txt[start:end + 1]
-
-        # Fix trailing commas
         txt = re.sub(r",\s*([}\]])", r"\1", txt)
-
-        # Strategy 1: direct parse
         try:
             return ATSCheckerAgent._build(json.loads(txt))
         except Exception:
             pass
-
-        # Strategy 2: sanitize backslashes then parse
         try:
             return ATSCheckerAgent._build(
-                json.loads(ATSCheckerAgent._sanitize(txt))
-            )
+                json.loads(ATSCheckerAgent._sanitize(txt)))
         except Exception:
             pass
-
-        # Strategy 3: regex extraction
-        logger.warning("ATS: JSON parse failed — using regex extraction")
+        logger.warning("ATS: JSON parse failed — regex extraction")
         return ATSCheckerAgent._regex_extract(text)
 
     @staticmethod
@@ -413,15 +342,12 @@ class ATSCheckerAgent:
         def get_int(pat, default=0):
             m = re.search(pat, text)
             return int(m.group(1)) if m else default
-
         def get_str(pat, default=""):
             m = re.search(pat, text, re.DOTALL)
             return m.group(1).strip() if m else default
-
         def get_list(pat):
             m = re.search(pat, text, re.DOTALL)
             return re.findall(r'"([^"]+)"', m.group(1)) if m else []
-
         score = get_int(r'"score"\s*:\s*(\d+)', 0)
         return {
             "score":                score,

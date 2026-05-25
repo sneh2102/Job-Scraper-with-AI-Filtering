@@ -30,7 +30,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline")
 
-# ── These are set dynamically from app_config.json in main() ─
 MAX_ATS_ITERATIONS = 2
 ATS_PASS_THRESHOLD = 85
 
@@ -51,7 +50,6 @@ def load_env(path: str = ".env"):
 
 
 def load_app_config() -> dict:
-    """Load settings from app_config.json."""
     try:
         if os.path.exists("app_config.json"):
             with open("app_config.json", encoding="utf-8") as f:
@@ -108,6 +106,11 @@ def build_output_path(base_dir: str, company: str, title: str, filename: str) ->
 # ══════════════════════════════════════════════════════════════
 
 def _extract_body(latex: str) -> dict:
+    """
+    Extract all sections from assembled LaTeX.
+    Reads education directly from the latex — never re-injects FIXED_EDUCATION
+    (which caused duplication on every ATS iteration).
+    """
     from agents.resume_builder import LATEX_PREAMBLE, FIXED_HEADER, FIXED_EDUCATION
 
     body = latex.replace(LATEX_PREAMBLE, "").replace("\\end{document}", "").strip()
@@ -122,33 +125,83 @@ def _extract_body(latex: str) -> dict:
                 return idx
         return -1
 
+    edu_idx   = find_sec(body, "Education",        "EDUCATION")
     skill_idx = find_sec(body, "Technical Skills", "Skills", "SKILLS")
-    exp_idx   = find_sec(body, "Experience", "EXPERIENCE", "Work Experience")
-    proj_idx  = find_sec(body, "Relevant Projects", "Projects", "PROJECTS")
+    exp_idx   = find_sec(body, "Experience",       "EXPERIENCE", "Work Experience")
+    proj_idx  = find_sec(body, "Relevant Projects","Projects",   "PROJECTS")
 
-    logger.info("Section indices — Skills: %d | Exp: %d | Projects: %d",
-                skill_idx, exp_idx, proj_idx)
+    logger.info("Section indices — Edu: %d | Skills: %d | Exp: %d | Projects: %d",
+                edu_idx, skill_idx, exp_idx, proj_idx)
+
+    # Header = everything before first section
+    first_section = min(
+        idx for idx in [edu_idx, skill_idx, exp_idx, proj_idx] if idx > -1
+    ) if any(idx > -1 for idx in [edu_idx, skill_idx, exp_idx, proj_idx]) else -1
+
+    header = body[:first_section].strip() if first_section > 0 else FIXED_HEADER
+    if not header:
+        header = FIXED_HEADER
+
+    # Extract education from body (NOT from module variable)
+    if edu_idx > -1:
+        edu_end   = skill_idx if (skill_idx > -1 and skill_idx > edu_idx) else exp_idx
+        if edu_end == -1:
+            edu_end = exp_idx if (exp_idx > -1 and exp_idx > edu_idx) else proj_idx
+        education = body[edu_idx:edu_end].strip() if edu_end > -1 else body[edu_idx:].strip()
+    else:
+        education = FIXED_EDUCATION
+
+    # Extract skills
+    if skill_idx > -1 and exp_idx > skill_idx:
+        skills = body[skill_idx:exp_idx].strip()
+    elif skill_idx > -1:
+        skills = body[skill_idx:].strip()
+    else:
+        skills = ""
+
+    # Extract experience
+    if exp_idx > -1 and proj_idx > exp_idx:
+        experience = body[exp_idx:proj_idx].strip()
+    elif exp_idx > -1:
+        experience = body[exp_idx:].strip()
+    else:
+        experience = ""
+
+    # Extract projects
+    projects = body[proj_idx:].strip() if proj_idx > -1 else ""
 
     return {
-        "header":     FIXED_HEADER,
-        "education":  FIXED_EDUCATION,
-        "skills":     body[skill_idx:exp_idx].strip() if skill_idx > -1 and exp_idx  > -1 else "",
-        "experience": body[exp_idx:proj_idx].strip()  if exp_idx   > -1 and proj_idx > -1 else "",
-        "projects":   body[proj_idx:].strip()          if proj_idx  > -1 else "",
+        "header":     header,
+        "education":  education,
+        "skills":     skills,
+        "experience": experience,
+        "projects":   projects,
     }
 
 
 def _reassemble_latex(body: dict) -> str:
+    """Reassemble LaTeX from sections, respecting section_order from app_config."""
     from agents.resume_builder import LATEX_PREAMBLE
-    return (
-        LATEX_PREAMBLE
-        + "\n\n" + body.get("header",     "")
-        + "\n\n" + body.get("education",  "")
-        + "\n\n" + body.get("skills",     "")
-        + "\n\n" + body.get("experience", "")
-        + "\n\n" + body.get("projects",   "")
-        + "\n\n\\end{document}"
-    )
+
+    order = ["education", "skills", "experience", "projects"]
+    try:
+        if os.path.exists("app_config.json"):
+            with open("app_config.json", encoding="utf-8") as f:
+                cfg = json.load(f)
+            saved_order = cfg.get("section_order", [])
+            required    = {"education", "skills", "experience", "projects"}
+            if saved_order and set(saved_order) == required:
+                order = saved_order
+    except Exception:
+        pass
+
+    result = LATEX_PREAMBLE + "\n\n" + body.get("header", "")
+    for key in order:
+        content = body.get(key, "")
+        if content:
+            result += "\n\n" + content
+    result += "\n\n\\end{document}"
+    return result
 
 
 # ══════════════════════════════════════════════════════════════
@@ -157,13 +210,8 @@ def _reassemble_latex(body: dict) -> str:
 
 def process_job(row, builder, checker, output_base, use_pdflatex,
                 max_iterations: int = None, pass_threshold: int = None):
-    """
-    Build resume + cover letter for one job, run ATS loop, save PDFs.
-    max_iterations and pass_threshold come from app_config.json.
-    """
-    # ── Use global defaults if not passed ────────────────────
-    _max_iter   = max_iterations if max_iterations is not None else MAX_ATS_ITERATIONS
-    _threshold  = pass_threshold if pass_threshold is not None else ATS_PASS_THRESHOLD
+    _max_iter  = max_iterations if max_iterations is not None else MAX_ATS_ITERATIONS
+    _threshold = pass_threshold if pass_threshold is not None else ATS_PASS_THRESHOLD
 
     best_score     = 0
     no_improve     = 0
@@ -173,7 +221,6 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
     title       = str(row.get("title",       "Unknown_Position"))
     description = row.get("description",     "")
 
-    # Guard against nan / empty
     if not description or str(description).strip() in ("nan", "None", ""):
         description = (
             f"Software engineering role at {company}. "
@@ -194,13 +241,10 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
     ats_result  = {}
     final_score = 0
 
-    # ── ATS feedback loop ─────────────────────────────────────
     for iteration in range(1, _max_iter + 1):
         logger.info("ATS iteration %d / %d", iteration, _max_iter)
         try:
-            ats_result  = checker.check(
-                title=title, description=description, latex=latex
-            )
+            ats_result  = checker.check(title=title, description=description, latex=latex)
             final_score = ats_result["score"]
             sections    = ats_result.get("section_scores", {})
 
@@ -214,8 +258,7 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
             )
 
             if ats_result.get("missing_keywords"):
-                logger.info("Missing: %s",
-                            ", ".join(ats_result["missing_keywords"][:8]))
+                logger.info("Missing: %s", ", ".join(ats_result["missing_keywords"][:8]))
 
             if ats_result.get("pass") or final_score >= _threshold:
                 logger.info("✅ ATS passed with score %d", final_score)
@@ -230,7 +273,6 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
                 logger.info("No sections flagged — stopping early")
                 break
 
-            # No-improve guard
             if final_score > best_score:
                 best_score = final_score
                 no_improve = 0
@@ -251,9 +293,7 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
                     continue
 
                 body_key = {
-                    "skills":     "skills",
-                    "experience": "experience",
-                    "projects":   "projects",
+                    "skills": "skills", "experience": "experience", "projects": "projects"
                 }.get(section, section)
 
                 current_section_latex = body.get(body_key, "")
@@ -280,15 +320,12 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
             final_score = final_score or 70
             break
 
-    # ── Save outputs ──────────────────────────────────────────
     if not latex:
         return {"company": company, "title": title, "score": 0, "status": "failed",
                 "resume_path": "", "cover_path": ""}
 
-    # ── Read filenames from env (set by main() from app_config) ──
     resume_name = os.getenv("RESUME_FILENAME",       "Resume")
     cover_name  = os.getenv("COVER_LETTER_FILENAME", "Cover_Letter")
-
     logger.info("Saving as: %s.pdf / %s.pdf", resume_name, cover_name)
 
     tex_path        = build_output_path(output_base, company, title, f"{resume_name}.tex")
@@ -321,7 +358,6 @@ def main():
 
     load_env(".env")
 
-    # ── Load ALL settings from app_config.json ────────────────
     app_cfg  = load_app_config()
     pipe_cfg = app_cfg.get("pipeline", {})
 
@@ -331,7 +367,6 @@ def main():
     projects_path = os.getenv("PROJECTS_PATH", pipe_cfg.get("projects_path", "Projects.txt"))
     model         = os.getenv("MODEL",         app_cfg.get("model", {}).get("name", "gemma4:31b-cloud"))
 
-    # ── Read iterations and threshold from app_config ─────────
     max_iterations = int(pipe_cfg.get("max_ats_iterations", 2))
     pass_threshold = int(pipe_cfg.get("ats_pass_threshold", 85))
     MAX_ATS_ITERATIONS = max_iterations
@@ -339,7 +374,6 @@ def main():
     logger.info("ATS config — max iterations: %d | pass threshold: %d",
                 max_iterations, pass_threshold)
 
-    # ── Read filenames from app_config and inject into env ────
     resume_filename = pipe_cfg.get("resume_filename", "Resume")
     cover_filename  = pipe_cfg.get("cover_letter_filename", "Cover_Letter")
     os.environ["RESUME_FILENAME"]       = resume_filename
@@ -350,7 +384,6 @@ def main():
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"Excel file not found: {excel_path}")
 
-    # ── Read API keys from app_config ─────────────────────────
     config_keys = app_cfg.get("model", {}).get("api_keys", [])
     if config_keys:
         for i, key in enumerate(config_keys, 1):
@@ -369,22 +402,6 @@ def main():
     if not use_pdflatex:
         logger.warning("pdflatex not found — resumes saved as .tex only")
 
-    # ── Google integration ─────────────────────────────────────
-    google_cfg     = app_cfg.get("google", {})
-    google_enabled = False
-    spreadsheet_id = google_cfg.get("spreadsheet_id", "")
-    gdrive_folder  = google_cfg.get("drive_folder",   "Job Applications")
-    gsheet_tab     = google_cfg.get("sheet_tab",      "Sheet1")
-
-    if spreadsheet_id and google_cfg.get("enabled", False):
-        try:
-            from google_integration import upload_and_track
-            google_enabled = True
-            logger.info("Google Drive + Sheets integration enabled.")
-        except ImportError:
-            logger.warning("google_integration.py not found — Drive upload disabled")
-
-    # ── Load jobs ─────────────────────────────────────────────
     df       = pd.read_excel(excel_path, engine="openpyxl")
     yes_jobs = df[df["AI_recommendation"].str.lower() == "yes"].reset_index(drop=True)
     logger.info("Found %d jobs with verdict = yes", len(yes_jobs))
@@ -393,7 +410,6 @@ def main():
         logger.info("Nothing to process.")
         return
 
-    # ── Process each job ──────────────────────────────────────
     results = []
     for idx, row in yes_jobs.iterrows():
         try:
@@ -402,56 +418,29 @@ def main():
                 max_iterations=max_iterations,
                 pass_threshold=pass_threshold,
             )
-
             result["job_url"]  = str(row.get("link",     ""))
             result["location"] = str(row.get("location", ""))
-
             results.append(result)
-            logger.info(
-                "[%d/%d] %s @ %s | Score: %s | Status: %s",
-                idx + 1, len(yes_jobs),
-                result["title"], result["company"],
-                result["score"], result["status"],
-            )
-
-            # ── Google upload ─────────────────────────────────
-            if google_enabled and result.get("status") not in ("failed", "error"):
-                try:
-                    urls = upload_and_track(
-                        result=result,
-                        spreadsheet_id=spreadsheet_id,
-                        root_folder_name=gdrive_folder,
-                        sheet_name=gsheet_tab,
-                    )
-                    if urls.get("resume_url"):
-                        logger.info("✅ Drive resume:  %s", urls["resume_url"])
-                    if urls.get("cover_url"):
-                        logger.info("✅ Drive cover:   %s", urls["cover_url"])
-                except Exception as e:
-                    logger.error("Google integration error: %s", e)
-
+            logger.info("[%d/%d] %s @ %s | Score: %s | Status: %s",
+                        idx + 1, len(yes_jobs),
+                        result["title"], result["company"],
+                        result["score"], result["status"])
         except Exception as e:
             logger.error("Unhandled error on job %d: %s", idx, e)
             results.append({
                 "company": row.get("company", ""),
                 "title":   row.get("title",   ""),
-                "score":   0,
-                "status":  "error",
+                "score":   0, "status": "error",
             })
-
         time.sleep(1)
 
-    # ── Summary ───────────────────────────────────────────────
     logger.info("=" * 60)
     logger.info("PIPELINE COMPLETE")
     logger.info("=" * 60)
     for r in results:
-        logger.info(
-            "%-45s | Score: %3s | %s",
-            f"{r['title']} @ {r['company']}"[:45],
-            r.get("score", "n/a"),
-            r.get("status", "unknown"),
-        )
+        logger.info("%-45s | Score: %3s | %s",
+                    f"{r['title']} @ {r['company']}"[:45],
+                    r.get("score", "n/a"), r.get("status", "unknown"))
     passed = sum(1 for r in results if r.get("status") == "done")
     failed = sum(1 for r in results if r.get("status") in ("failed", "error", "tex_only"))
     logger.info("Done: %d | Failed: %d | Total: %d", passed, failed, len(results))

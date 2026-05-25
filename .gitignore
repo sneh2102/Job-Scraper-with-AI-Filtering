@@ -11,3 +11,16 @@ dist/
 *.csv
 outputs/
 credentials.json
+*.log
+app_config.json
+app-config.json
+JobHunter_Windows.zip
+*.rar
+*.zip
+*.tar.gz
+*.tgz
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+

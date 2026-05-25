@@ -10,7 +10,7 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 from tqdm import tqdm
-from ai import OllamaAssistant
+from ai import OllamaAssistant, parse_ai_verdict, send_with_retries
 from jobs_scraper import *
 
 # --------------------------- Config & Constants ---------------------------
@@ -37,19 +37,13 @@ logging.basicConfig(level=logging.INFO)
 
 excel_file = "jobs.xlsx"
 
-PERSONAL_JOB_FINDER_PROMPT = """
+DEFAULT_JOB_FINDER_PROMPT = """
 You are a ruthless but fair IT job screener evaluating whether a candidate should apply to a job posting.
 
 -----------------------------------------------------
 CANDIDATE PROFILE
 -----------------------------------------------------
-- Name: Sneh Patel
-- Experience: ~2 years (internships + full-time roles combined)
-- Education: Master of Applied Computer Science (Dalhousie University, 2025)
-- Location: Halifax, NS, Canada — open to Remote, Hybrid, or Relocation across Canada
-- Core Stack: Python, Java, TypeScript, JavaScript, React, Node.js, AWS, Docker, Kubernetes, PostgreSQL, FastAPI, LangChain, Terraform, Apache Kafka, Spark
-- Domains: Full-Stack Development, Cloud/DevOps, Data Engineering, AI/ML Integration, IT Support/Systems Analysis
-- NOT a fit for: Pure QA, manual testing only, non-technical roles, embedded/FPGA, hardware engineering
+{candidate_profile}
 
 -----------------------------------------------------
 INPUTS
@@ -63,13 +57,13 @@ EVALUATION RULES (apply in order)
 -----------------------------------------------------
 
 STEP 1 — DOMAIN FILTER
-Accept ONLY if the role clearly belongs to: Software Development, Data Engineering, Cloud, DevOps, AI/ML, IT Support, Systems Analysis, Cybersecurity, or adjacent technical domains.
-Reject immediately if: Marketing, HR, Finance, Sales, Manual QA, Hardware Engineering, or non-technical.
+Accept ONLY if the role clearly belongs to the candidate's specified domains.
+Reject immediately if the role is non-technical or outside the candidate's expertise.
 If rejected here — verdict = "no", stop evaluation.
 
 STEP 2 — EXPERIENCE GAP CHECK
-Extract the required years of experience from the JD (look for phrases like "X+ years", "minimum X years", "X to Y years").
-Compare against candidate's 2 years:
+Extract the required years of experience from the JD.
+Compare against candidate's experience:
 - 0 to 4 years required — PASS (good fit range)
 - 5 years required — BORDERLINE (check if skills compensate)
 - 6+ years required — FAIL (too senior, do not apply)
@@ -159,54 +153,27 @@ def load_df():
 
 def parse_json_response(response_text: str):
     """
-    Robust JSON extraction supporting the new richer response schema.
-    Returns a dict with all fields, with safe defaults for any missing keys.
+    Uses robust parsing from ai.py and formats for Excel.
     """
-    try:
-        txt = response_text.strip()
+    result = parse_ai_verdict(response_text)
 
-        # Strip fenced code blocks if present
-        if txt.startswith("```"):
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", txt, re.IGNORECASE)
-            if m:
-                txt = m.group(1).strip()
+    matched_skills = result.get("matched_skills", [])
+    if isinstance(matched_skills, list):
+        matched_skills = ", ".join(matched_skills)
 
-        # Remove trailing commas before closing braces/brackets
-        txt = re.sub(r",\s*([}\]])", r"\1", txt)
+    missing_skills = result.get("missing_skills", [])
+    if isinstance(missing_skills, list):
+        missing_skills = ", ".join(missing_skills)
 
-        parsed = json.loads(txt)
-
-        verdict = str(parsed.get("verdict", "")).lower().strip()
-        if verdict not in {"yes", "no", "maybe"}:
-            raise ValueError(f"Invalid verdict: {verdict!r}")
-
-        years_required = str(parsed.get("years_required", "unspecified")).strip()
-        role_level = str(parsed.get("role_level", "unspecified")).lower().strip()
-        skills_match_pct = int(parsed.get("skills_match_pct", 0))
-
-        matched_skills = parsed.get("matched_skills", [])
-        if isinstance(matched_skills, list):
-            matched_skills = ", ".join(matched_skills)
-
-        missing_skills = parsed.get("missing_skills", [])
-        if isinstance(missing_skills, list):
-            missing_skills = ", ".join(missing_skills)
-
-        reasoning = str(parsed.get("reasoning", "")).strip()
-
-        return {
-            "verdict": verdict,
-            "years_required": years_required,
-            "role_level": role_level,
-            "skills_match_pct": skills_match_pct,
-            "matched_skills": matched_skills,
-            "missing_skills": missing_skills,
-            "reasoning": reasoning,
-        }
-
-    except Exception as e:
-        logging.error("Invalid or unparsable JSON from model:\n%s", response_text)
-        raise e
+    return {
+        "verdict": result["verdict"],
+        "years_required": result["years_required"],
+        "role_level": result["role_level"],
+        "skills_match_pct": result["skills_match_pct"],
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "reasoning": result["reasoning"],
+    }
 
 
 def beautify_excel(path: str = None):
@@ -298,21 +265,9 @@ def write_excel_safely(df: pd.DataFrame, path: str) -> str:
         return fallback
 
 
-def send_with_retries(assistant, msg: str, tries: int = 3, backoff_sec: float = 1.5):
-    last_err = None
-    for attempt in range(1, tries + 1):
-        try:
-            return assistant.submit_message(msg)
-        except Exception as e:
-            last_err = e
-            logging.warning("Model call failed (attempt %d/%d): %s", attempt, tries, e)
-            time.sleep(backoff_sec * attempt)
-    raise last_err
-
-
 # --------------------------- Core Flow ---------------------------
 
-def scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text):
+def scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text, prompt_template):
     offset = 0
     new_data = [0]
     df = pd.DataFrame(columns=required_columns)
@@ -328,24 +283,15 @@ def scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text):
                 os.getenv("results_wanted"),
                 offset,
             )
-            logging.info(f"{len(new_data)} jobs scraped")
-        except Exception as e:
-            logging.error("An error occurred while scraping: %s", e)
-            logging.error("Stack trace: %s", traceback.format_exc())
-            new_data = pd.DataFrame(columns=required_columns)
-
-        for index, row in tqdm(new_data.iterrows(), total=len(new_data), desc="Analyzing Jobs"):
-            try:
-                job_url = row.get("job_url", "")
-                if job_url in unique_urls:
-                    continue
-
+            logging a a...
+... [truncated] ...
                 msg = format_prompt(
-                    PERSONAL_JOB_FINDER_PROMPT,
+                    prompt_template,
                     title=row.get("title", ""),
                     description=row.get("description", ""),
                     resume_text=resume_text,
                 )
+... [truncated] ...
 
                 ai_response = send_with_retries(assistant, msg, tries=3, backoff_sec=1.5)
                 logging.info("Ollama response received.")
@@ -402,10 +348,25 @@ def main():
 
     resume_text = load_resume_text(os.getenv("RESUME_PATH", "instructions.txt"))
 
+    # Load user profile and prepare the AI prompt
+    profile = load_profile()
+    profile_ctx = build_profile_prompt_context(profile)
+
+    # Load prompt template from config or use default
+    try:
+        with open("app_config.json", "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        prompt_template = cfg.get("prompts", {}).get("job_screener", DEFAULT_JOB_FINDER_PROMPT)
+    except Exception:
+        prompt_template = DEFAULT_JOB_FINDER_PROMPT
+
+    # Inject candidate profile into the prompt
+    prompt_template = prompt_template.replace("{candidate_profile}", profile_ctx)
+
     assistant = OllamaAssistant(model=os.getenv("model", "gemma3:e4b"))
     logging.info(f"Ollama Assistant ready using model: {assistant.model}")
 
-    new_df = scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text)
+    new_df = scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text, prompt_template)
     df = pd.concat([data, new_df], ignore_index=True)
     written_path = write_excel_safely(df, excel_file)
     logging.info(f"Excel written to: {written_path}")

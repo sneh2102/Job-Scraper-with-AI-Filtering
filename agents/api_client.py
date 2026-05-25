@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 
 
 class RotatingOllamaClient:
-    def __init__(self, api_keys: list[str], model: str = "gemma3:e4b"):
+    def __init__(self, api_keys: list[str], model: str = "gemma4:31b-cloud"):
         if not api_keys:
             raise ValueError("Provide at least one Ollama API key.")
         self.api_keys      = api_keys
@@ -34,9 +34,8 @@ class RotatingOllamaClient:
     @staticmethod
     def _looks_like_content(err_str: str) -> bool:
         """
-        Check if an exception message is actually a partial response
-        from the model (not a real error).
-        Ollama sometimes raises partial JSON/text as an exception.
+        Detect if an exception message is actually a partial model response.
+        Ollama sometimes raises partial JSON/LaTeX as an exception instead of returning it.
         """
         stripped = err_str.strip()
         content_signals = (
@@ -47,7 +46,6 @@ class RotatingOllamaClient:
         )
         return (
             stripped.startswith("{") or
-            stripped.startswith('"') or
             any(signal in stripped for signal in content_signals)
         )
 
@@ -61,10 +59,11 @@ class RotatingOllamaClient:
     ) -> str:
         last_error = None
 
+        logger.info("Ollama request — model: %s | system: %d chars | user: %d chars",
+                    self.model, len(system), len(user))
+
         for attempt in range(retries * len(self.api_keys)):
             try:
-                logger.info("Ollama request — model: %s | system: %d chars | user: %d chars",
-                self.model, len(system), len(user))
                 response = self.client.chat(
                     model=self.model,
                     messages=[
@@ -78,24 +77,24 @@ class RotatingOllamaClient:
                         "temperature": 0.3,
                     },
                 )
-                return response["message"]["content"].strip()
+                result = response["message"]["content"].strip()
+                logger.info("Ollama response [%d chars]: %s...", len(result), result[:120])
+                return result
 
             except Exception as e:
-                err_str = str(e)
+                err_str   = str(e)
                 err_lower = err_str.lower()
 
-                # ── Partial response returned as exception ────
-                # Ollama occasionally raises the model's partial output
-                # as an exception instead of returning it normally.
+                # Partial response raised as exception — return it for caller to parse
                 if self._looks_like_content(err_str):
                     logger.warning(
-                        "Partial model response returned as exception "
-                        "(attempt %d) — returning content directly | preview: %s",
+                        "Partial model response as exception (attempt %d) — "
+                        "returning for parsing | preview: %s",
                         attempt + 1, err_str[:60]
                     )
-                    return err_str  # caller (_parse) handles partial content
+                    return err_str
 
-                # ── Rate limit / auth — rotate key ────────────
+                # Rate limit / auth — rotate key
                 if any(x in err_lower for x in
                        ["rate limit", "429", "401", "403", "quota", "limit exceeded"]):
                     logger.warning("Key %d hit limit: %s — rotating.",
@@ -103,7 +102,7 @@ class RotatingOllamaClient:
                     self._rotate()
                     continue
 
-                # ── Other error — retry with backoff ──────────
+                # Other error — retry with backoff
                 last_error = e
                 wait = backoff * (attempt + 1)
                 logger.error(
@@ -112,6 +111,4 @@ class RotatingOllamaClient:
                 )
                 time.sleep(wait)
 
-        result = response["message"]["content"].strip()
-        logger.info("Ollama response [%d chars]: %s...", len(result), result[:120])
-        return result
+        raise RuntimeError(f"All retries and keys failed. Last error: {last_error}")

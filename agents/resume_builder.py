@@ -5,6 +5,8 @@ import os
 import logging
 from datetime import date
 from agents.api_client import RotatingOllamaClient
+from ai import load_profile
+from setup_wizard import build_fixed_header
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ LATEX_PREAMBLE = r"""
 }
 \newcommand{\resumeProjectHeading}[2]{
     \item
-    \begin{tabular*}{1.001\textwidth}{l@{\extracolsep{\fill}}r}
+    \begin{tabular*}{1\textwidth}{l@{\extracolsep{\fill}}r}
       \small#1 & \textbf{\small #2}\\
     \end{tabular*}\vspace{-7pt}
 }
@@ -473,10 +475,24 @@ class ResumeBuilderAgent:
         p_projects    = prompts.get("projects_section")   or PROMPT_PROJECTS
         p_cover       = prompts.get("cover_letter")       or PROMPT_COVER_LETTER
 
-        # Extract location from JD for header
-        location  = self._extract_location(safe_desc)
-        header    = FIXED_HEADER.replace("LOCATION", location)
-        education = FIXED_EDUCATION
+        # Build Header and Education from profile
+        profile = load_profile()
+        header = build_fixed_header(profile)
+
+        edu_list = profile.get("education", [])
+        if edu_list:
+            edu_content = "\n".join([
+                f"  \\resumeSubheading{{{e.get('degree','Your Degree')}}}{{{e.get('dates','Start -- End')}}}{{{e.get('institution','Your University')}}}{{{e.get('location','City, Province')}}}"
+                for e in edu_list
+            ])
+            education = r"""
+\section{Education}
+\resumeSubHeadingListStart
+""" + edu_content + r"""
+\resumeSubHeadingListEnd
+"""
+        else:
+            education = FIXED_EDUCATION
 
         logger.info("Building skills section...")
         skills = self._clean(self.client.complete(
@@ -521,9 +537,12 @@ class ResumeBuilderAgent:
                 description=safe_desc,
                 existing_resume=self.existing_resume,
                 today=date.today().strftime("%B %d, %Y"),
-                candidate_name=profile["full_name"],
-                candidate_phone=profile["phone"],
-                candidate_email=profile["email"],
+                candidate_name=profile.get("full_name", "Your Name"),
+                candidate_phone=profile.get("phone", "+1 (000) 000-0000"),
+                candidate_email=profile.get("email", "your@email.com"),
+                full_name=profile.get("full_name", "Your Name"),
+                phone=profile.get("phone", "+1 (000) 000-0000"),
+                email=profile.get("email", "your@email.com"),
             ),
         ).strip()
 
@@ -606,15 +625,38 @@ RULES:
     # ── Assembly ──────────────────────────────────────────────
     @staticmethod
     def _assemble(header, education, skills, experience, projects) -> str:
-        return (
-            LATEX_PREAMBLE
-            + "\n\n" + header
-            + "\n\n" + education
-            + "\n\n" + skills
-            + "\n\n" + experience
-            + "\n\n" + projects
-            + "\n\n\\end{document}"
-        )
+        import json as _json
+        import os as _os
+    
+        # Load section order from app_config.json
+        order = ["education", "skills", "experience", "projects"]
+        try:
+            config_path = _os.path.join(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                "app_config.json"
+            )
+            if _os.path.exists(config_path):
+                with open(config_path, encoding="utf-8") as f:
+                    cfg = _json.load(f)
+                saved = cfg.get("section_order", [])
+                if saved and set(saved) == {"education", "skills", "experience", "projects"}:
+                    order = saved
+        except Exception:
+            pass
+    
+        section_map = {
+            "education":  education,
+            "skills":     skills,
+            "experience": experience,
+            "projects":   projects,
+        }
+    
+        result = LATEX_PREAMBLE + "\n\n" + header
+        for key in order:
+            result += "\n\n" + section_map.get(key, "")
+        result += "\n\n\\end{document}"
+        return result
+    
 
     # ── Location extractor ────────────────────────────────────
     @staticmethod
@@ -651,9 +693,9 @@ RULES:
         for city, formatted in city_map.items():
             if city in desc_lower:
                 return formatted
-        if any(x in desc_lower for x in ["remote", "India-wide", "anywhere in india", "work from home"]):
-            return "India"
-        return "Gujarat, India"
+        if any(x in desc_lower for x in ["remote", "Canada-wide", "anywhere in canada", "work from home"]):
+            return "Canada"
+        return "Canada"
 
     # ── Helpers ───────────────────────────────────────────────
     @staticmethod

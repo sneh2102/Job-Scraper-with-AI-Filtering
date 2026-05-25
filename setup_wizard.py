@@ -34,26 +34,20 @@ def load_profile(config_file="app_config.json") -> dict:
         "email":          "your@email.com",
         "linkedin":       "linkedin.com/in/yourprofile",
         "github":         "github.com/yourusername",
-        "location":       "Your City, Province, Canada",
-        "experience_yrs": "3",
+        "location":       "Your City, Province, Country",
+        "experience_yrs": "0",
         "education": [
             {
-                "degree":      "Master of Applied Computer Science",
-                "dates":       "Sept 2023 -- Jun 2025",
-                "institution": "Dalhousie University",
-                "location":    "Halifax, NS",
-            },
-            {
-                "degree":      "Bachelor of Technology in Computer Engineering",
-                "dates":       "Aug 2019 -- May 2023",
+                "degree":      "Your Degree",
+                "dates":       "Start Date -- End Date",
                 "institution": "Your University",
-                "location":    "Your City",
+                "location":    "City, Country",
             },
         ],
         "core_stack":     "Python, JavaScript, React, Node.js, AWS, Docker",
-        "domains":        "Full-Stack Development, Cloud/DevOps, AI/ML",
+        "domains":        "Full-Stack Development, Cloud/DevOps",
         "not_fit_for":    "Pure QA, Manual Testing, Hardware Engineering, Non-technical",
-        "job_titles":     "Software Developer, Full Stack Developer, Backend Developer, Data Engineer",
+        "job_titles":     "Software Developer, Full Stack Developer",
     }
     try:
         if os.path.exists(config_file):
@@ -76,6 +70,7 @@ def build_fixed_header(profile: dict) -> str:
     email    = profile.get("email",      "your@email.com")
     linkedin = profile.get("linkedin",   "")
     github   = profile.get("github",     "")
+    location = profile.get("location",   "Your City, Province, Country")
 
     # Build contact line
     contact_parts = []
@@ -106,7 +101,7 @@ def build_fixed_header(profile: dict) -> str:
     return f"""
 \\begin{{center}}
     {{\\Huge \\scshape {name}}} \\\\ \\vspace{{6pt}}
-    \\faMapMarker*\\ LOCATION \\\\
+    \\faMapMarker*\\ {location} \\\\
     \\vspace{{2pt}}
     {contact_line}
 \\end{{center}}
@@ -384,10 +379,8 @@ class SetupWizard(ctk.CTkToplevel):
         self._edu_rows = []
         profile  = self.config.get("profile", default={})
         edu_list = profile.get("education", [
-            {"degree": "Master of Applied Computer Science", "dates": "Sept 2023 -- Jun 2025",
-             "institution": "Dalhousie University", "location": "Halifax, NS"},
-            {"degree": "Bachelor of Technology in Computer Engineering", "dates": "Aug 2019 -- May 2023",
-             "institution": "Gujarat Technological University", "location": "Gandhinagar, India"},
+            {"degree": "Your Degree", "dates": "Start Date -- End Date",
+             "institution": "Your University", "location": "City, Country"},
         ])
         for edu in edu_list:
             self._add_edu_row(edu)
@@ -454,17 +447,8 @@ class SetupWizard(ctk.CTkToplevel):
 
         saved = self.config.get("experience_roles", default=None)
         roles = saved or [
-            {"title": "Support Consultant",  "company": "Nova Scotia Health Authority",
-             "dates": "Feb 2026 – Present",  "domain": "healthcare IT, systems, user support",
-             "total_bullets": 5, "real_bullets": 2, "fabricated_bullets": 3},
-            {"title": "Software Developer",  "company": "TeleAI Corporation",
-             "dates": "Jan 2025 – May 2025", "domain": "AI/ML, full-stack, APIs",
-             "total_bullets": 4, "real_bullets": 2, "fabricated_bullets": 2},
-            {"title": "R&D Project Engineer","company": "MyTech Lab",
-             "dates": "Sept 2024 – Dec 2024","domain": "research, algorithms, optimization",
-             "total_bullets": 3, "real_bullets": 1, "fabricated_bullets": 2},
-            {"title": "Full-Stack Developer","company": "Webforest LLP",
-             "dates": "Jan 2023 – Jul 2023", "domain": "web development, databases, deployment",
+            {"title": "Job Title",  "company": "Company Name",
+             "dates": "Month Year – Month Year",  "domain": "Your Domain",
              "total_bullets": 4, "real_bullets": 2, "fabricated_bullets": 2},
         ]
         for role in roles:

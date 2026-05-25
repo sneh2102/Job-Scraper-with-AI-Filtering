@@ -6,6 +6,7 @@ python app.py
 """
 import sys
 import os
+from ai import OllamaAssistant, parse_ai_verdict, send_with_retries
 
 # Fix paths when running as PyInstaller exe
 if getattr(sys, 'frozen', False):
@@ -22,9 +23,11 @@ import threading
 import queue
 import json
 import os
+import shutil
 import sys
 import logging
 import time
+import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from setup_wizard import check_and_run_setup, ProfileTab, load_profile
@@ -62,10 +65,12 @@ DEFAULT_CONFIG = {
         "ats_pass_threshold": 85,
         "output_dir": "outputs",
         "excel_path": "jobs.xlsx",
+        "applied_excel_path": "Job-Tracker.xlsx",
+        "applied_folder_path": "fultime",
         "resume_path": "resume.txt",
         "projects_path": "Projects.txt",
-        "resume_filename": "Sneh_Resume",
-        "cover_letter_filename": "Sneh_Cover_Letter",
+        "resume_filename": "Resume",
+        "cover_letter_filename": "Cover_Letter",
     },
     "google": {
         "enabled": False,
@@ -79,21 +84,12 @@ DEFAULT_CONFIG = {
 # PROMPT 1: JOB SCREENER
 # ══════════════════════════════════════════════════════════════
 "job_screener": """You are a ruthless but contextually aware IT job screener.
-Your job is to evaluate whether Sneh Patel should apply to this position.
+Your job is to evaluate whether the candidate should apply to this position.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CANDIDATE PROFILE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Name:       Sneh Patel
-Experience: ~3 years (internships + full-time combined)
-Education:  Master of Applied Computer Science — Dalhousie University (2025)
-            B.Tech Computer Engineering — GTU India (2023)
-Location:   Halifax, NS, Canada — open to Remote, Hybrid, Relocation across Canada
-Core Stack: Python, Java, TypeScript, JavaScript, React, Next.js, Node.js, FastAPI,
-            AWS, GCP, Docker, Kubernetes, PostgreSQL, MongoDB, Redis,
-            LangChain, Terraform, Apache Kafka, Spark, Airflow
-Domains:    Full-Stack Development, Cloud/DevOps, Data Engineering,
-            AI/ML Integration, IT Support, Systems Analysis, Cybersecurity
+{candidate_profile}
 
 STRONG FIT FOR:
 - Software Developer / Engineer (any stack)
@@ -110,7 +106,7 @@ NOT A FIT FOR:
 - Hardware / Embedded / FPGA Engineering
 - Marketing, Sales, HR, Finance, Non-technical
 - Roles requiring 6+ years experience
-- Roles requiring specific certifications Sneh doesn't have (PMP, CPA, etc.)
+- Roles requiring specific certifications they don't have (PMP, CPA, etc.)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 INPUTS
@@ -134,7 +130,7 @@ LIBERAL RULE: If candidate has equivalent project/academic experience, give bene
 
 STEP 3 — SKILLS MATCH (BE LIBERAL WITH EQUIVALENTS)
 List every technical skill/tool/framework in the JD.
-Count each as matched if Sneh has it OR a clear equivalent:
+Count each as matched if candidate has it OR a clear equivalent:
   PostgreSQL ≈ MySQL ≈ SQL | AWS ≈ GCP ≈ Azure | React ≈ Vue ≈ Angular
   Docker ≈ containerization | Kubernetes ≈ container orchestration
 score = matched / total_jd_skills * 100
@@ -361,7 +357,7 @@ Raw LaTeX ONLY. No backticks. No preamble.""",
 # ══════════════════════════════════════════════════════════════
 # PROMPT 5: COVER LETTER
 # ══════════════════════════════════════════════════════════════
-"cover_letter": """You are writing a cover letter for Sneh Patel.
+"cover_letter": """You are writing a cover letter for {full_name}.
 Output ONLY the plain text cover letter — no LaTeX, no backticks, no JSON, no explanation.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -397,9 +393,9 @@ NEVER USE:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 EXACT FORMAT (follow precisely)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Sneh Patel
-+1 782-882-7207
-patel.sneh.jayeshbhai@gmail.com
+{full_name}
+{phone}
+{email}
 
 {today}
 
@@ -427,13 +423,13 @@ Your approach to learning and problem-solving. Mention that you prefer
 building things to understand them, and that you gravitate toward open-source tools.
 Make it honest and specific, not generic.
 
-[PARAGRAPH 4 — 2-3 sentences]
+[PARAGRAPH 4 — 2-3 la sentences]
 One specific reason why {company} appeals to you (reference their product, mission, or tech stack).
 Strong, confident close.
 
 Warm regards,
-Sneh Patel
-patel.sneh.jayeshbhai@gmail.com
+{full_name}
+{email}
 
 Plain text ONLY. No formatting symbols.""",
 
@@ -885,152 +881,195 @@ class ScraperTab(ctk.CTkFrame):
         try:
             sys.path.insert(0, os.getcwd())
             from jobs_scraper import scrape_all_jobs
-            from ai import OllamaAssistant
             import pandas as pd
+            import re as _re
 
-            cfg = self.config.data
+            cfg        = self.config.data
+            excel_path = cfg["pipeline"].get("excel_path", "jobs.xlsx")
+            model_name = cfg["model"]["name"]
+            api_keys   = cfg["model"]["api_keys"] if cfg["model"]["api_keys"] else [""]
 
             self.log_queue.put(("log", "INFO", "Starting job scraping..."))
 
+            # ── Load existing Excel + build URL skip-set ──────────
+            existing_df    = pd.DataFrame()
+            processed_urls = set()
+            if os.path.exists(excel_path):
+                try:
+                    existing_df    = pd.read_excel(excel_path, engine="openpyxl")
+                    processed_urls = set(
+                        existing_df["link"].dropna().astype(str).tolist()
+                    )
+                    self.log_queue.put(("log", "INFO",
+                        f"Loaded {len(existing_df)} existing rows. "
+                        f"{len(processed_urls)} URLs already processed."))
+                except Exception as load_err:
+                    self.log_queue.put(("log", "WARNING",
+                        f"Could not load existing Excel: {load_err}"))
+
+            # ── Scrape jobs ───────────────────────────────────────
             jobs = scrape_all_jobs(
-                site_name=cfg["scraper"]["sites"],
-                search_term=cfg["scraper"]["search_term"],
-                location=cfg["scraper"]["location"],
-                hours_old=cfg["scraper"]["hours_old"],
-                results_wanted=cfg["scraper"]["results_wanted"],
-                country_indeed=cfg["scraper"]["country_indeed"],
-                is_remote=cfg["scraper"]["is_remote"],
+                site_name      = cfg["scraper"]["sites"],
+                search_term    = cfg["scraper"]["search_term"],
+                location       = cfg["scraper"]["location"],
+                hours_old      = cfg["scraper"]["hours_old"],
+                results_wanted = cfg["scraper"]["results_wanted"],
+                country_indeed = cfg["scraper"]["country_indeed"],
+                is_remote      = cfg["scraper"]["is_remote"],
             )
+            self.log_queue.put(("log", "INFO",
+                f"Scraped {len(jobs)} jobs. Running AI filter..."))
 
-            self.log_queue.put(("log", "INFO", f"Scraped {len(jobs)} jobs. Running AI filter..."))
-
-            # Load resume
+            # ── Load resume text ──────────────────────────────────
             resume_text = ""
             rp = cfg["pipeline"].get("resume_path", "resume.txt")
             if os.path.exists(rp):
                 with open(rp, encoding="utf-8") as f:
                     resume_text = f.read()
 
-            # AI filter
-            # Replace the entire for loop section from:
-            # "# AI filter" to the end of the loop
+            # ── Prompt setup ──────────────────────────────────────
+            from ai import load_profile, build_profile_prompt_context
+            prompt_template = self.config.get(
+                "prompts", "job_screener",
+                default=DEFAULT_CONFIG["prompts"]["job_screener"]
+            )
 
-            # AI filter
-            model_name = cfg["model"]["name"]
-            api_keys   = cfg["model"]["api_keys"] if cfg["model"]["api_keys"] else [""]
+            # Inject candidate profile into the prompt
+            profile = load_profile()
+            profile_ctx = build_profile_prompt_context(profile)
+            prompt_template = prompt_template.replace("{candidate_profile}", profile_ctx)
 
-            from ollama import Client
-            api_key = api_keys[0] if api_keys else ""
-            if api_key or model_name.endswith("-cloud"):
-                client = Client(host="https://ollama.com",
-                                headers={"Authorization": f"Bearer {api_key}"})
-            else:
-                client = Client(host="http://localhost:11434")
+            SCHEMA_SUFFIX = (
+                "\n\nIMPORTANT: Respond with ONLY a JSON object. "
+                "No explanation. No markdown. No backticks.\n"
+                '{"verdict": "yes or maybe or no", '
+                '"years_required": "number or unspecified", '
+                '"role_level": "junior or mid or senior or unspecified", '
+                '"skills_match_pct": 50, '
+                '"matched_skills": [], '
+                '"missing_skills": [], '
+                '"reasoning": "two sentences"}'
+            )
 
-            prompt_template = self.config.get("prompts", "job_screener",
-                                            default=DEFAULT_CONFIG["prompts"]["job_screener"])
+            key_idx   = 0
+            processed = 0
+            skipped   = 0
+            yes_count = 0
 
-            # Strip the JSON schema from template — it confuses the model when embedded
-            # Instead, always append a clean schema instruction at the end
-            SCHEMA_SUFFIX = """
-
-            IMPORTANT: Respond with ONLY a JSON object. No explanation. No markdown. No backticks.
-            The JSON must have exactly these fields:
-            {"verdict": "yes or maybe or no", "years_required": "number or unspecified", "role_level": "junior or mid or senior or unspecified", "skills_match_pct": 50, "matched_skills": [], "missing_skills": [], "reasoning": "two sentences"}"""
-
-            results = []
-            key_idx = 0
-            
+            # ── ONE loop — process each job and save immediately ──
             for _, row in jobs.iterrows():
+                job_url = str(row.get("job_url", "")).strip()
+
+                # Skip already-saved URLs
+                if job_url and job_url in processed_urls:
+                    skipped += 1
+                    continue
+
+                # ── Build and call AI ─────────────────────────────
                 try:
-                    # Safe string replacement — avoids .format() breaking on JSON braces
-                    raw_desc = str(row.get("description", ""))
-                    # Remove excessive newlines
-                    import re as _re
-                    clean_desc = _re.sub(r'\n{3,}', '\n\n', raw_desc).strip()
-                    prompt = prompt_template \
-                        .replace("{title}",       str(row.get("title", "N/A"))) \
-                        .replace("{description}", clean_desc[:2500]) \
+                    raw_desc   = str(row.get("description", ""))
+                    clean_desc = _re.sub(r'\\n{3,}', '\\n\\n', raw_desc).strip()
+
+                    prompt = (
+                        prompt_template
+                        .replace("{title}",       str(row.get("title", "N/A")))
+                        .replace("{description}", clean_desc[:2500])
                         .replace("{resume_text}", resume_text[:1500])
+                    ) + SCHEMA_SUFFIX
 
-                    # Append schema suffix always — makes output predictable
-                    full_prompt = prompt + SCHEMA_SUFFIX
-
-                    # Rotate keys on rate limit
+                    # Rotating API keys via environment variable for the assistant
                     current_key = api_keys[key_idx % len(api_keys)] if api_keys else ""
-                    if current_key or model_name.endswith("-cloud"):
-                        client = Client(
-                            host="https://ollama.com",
-                            headers={"Authorization": f"Bearer {current_key}"}
-                        )
+                    os.environ["OLLAMA_API_KEY"] = current_key
 
-                    resp = client.chat(
-                        model=model_name,
-                        messages=[{"role": "user", "content": full_prompt}],
-                        stream=False,
-                        options={
-                            "num_predict": 1024,   # short — just needs JSON
-                            "temperature": 0.1,    # low — deterministic JSON
-                        },
-                    )
-                    text = resp["message"]["content"].strip()
+                    assistant = OllamaAssistant(model=model_name)
+                    text = send_with_retries(assistant, prompt)
+                    verdict = parse_ai_verdict(text)
                     self.log_queue.put(("log", "DEBUG", f"Raw response: {text[:80]}"))
 
-                    verdict = self._safe_parse_verdict(text)
-
-                    results.append({
-                        "AI_recommendation": verdict["verdict"],
-                        "company":           str(row.get("company", "")),
-                        "title":             str(row.get("title", "")),
-                        "link":              str(row.get("job_url", "")),
-                        "years_required":    verdict["years_required"],
-                        "role_level":        verdict["role_level"],
-                        "skills_match_pct":  verdict["skills_match_pct"],
-                        "matched_skills":    ", ".join(verdict.get("matched_skills", [])) if isinstance(verdict.get("matched_skills"), list) else str(verdict.get("matched_skills", "")),
-                        "missing_skills":    ", ".join(verdict.get("missing_skills", [])) if isinstance(verdict.get("missing_skills"), list) else str(verdict.get("missing_skills", "")),
-                        "reasoning":         verdict["reasoning"],
-                        "description":       str(row.get("description", "")),
-                        "posted_date":       str(row.get("date_posted", "")),
-                    })
-
-                    v = verdict["verdict"].upper()
-                    self.log_queue.put(("log", "INFO",
-                        f"[{v}] {row.get('title','')} @ {row.get('company','')} | {verdict['skills_match_pct']}%"))
-
-                except Exception as e:
-                    err = str(e)
-                    # Rotate key on rate limit
-                    if "429" in err or "rate" in err.lower():
+                except Exception as ai_err:
+                    err_str = str(ai_err)
+                    if "429" in err_str or "rate" in err_str.lower():
                         key_idx += 1
-                        self.log_queue.put(("log", "WARNING", f"Rate limited — rotating key ({key_idx})"))
+                        self.log_queue.put(("log", "WARNING",
+                            f"Rate limited — rotating to key {key_idx % len(api_keys)}"))
                     else:
-                        self.log_queue.put(("log", "WARNING", f"AI error: {err[:80]}"))
-                    # Don't skip — add with default verdict
-                    results.append({
-                        "AI_recommendation": "maybe",
-                        "company":           str(row.get("company", "")),
-                        "title":             str(row.get("title", "")),
-                        "link":              str(row.get("job_url", "")),
-                        "years_required":    "unspecified",
-                        "role_level":        "unspecified",
-                        "skills_match_pct":  50,
-                        "matched_skills":    "",
-                        "missing_skills":    "",
-                        "reasoning":         f"AI error: {err[:100]}",
-                        "description":       str(row.get("description", ""))[:500],
-                        "posted_date":       str(row.get("date_posted", "")),
-                    })
+                        self.log_queue.put(("log", "WARNING",
+                            f"AI error: {err_str[:80]}"))
+                    verdict = {
+                        "verdict": "maybe", "years_required": "unspecified",
+                        "role_level": "unspecified", "skills_match_pct": 50,
+                        "matched_skills": [], "missing_skills": [],
+                        "reasoning": f"AI error: {err_str[:100]}",
+                    }
 
-            # Save to Excel
-            excel_path = cfg["pipeline"].get("excel_path", "jobs.xlsx")
-            existing   = pd.DataFrame()
-            if os.path.exists(excel_path):
-                existing = pd.read_excel(excel_path, engine="openpyxl")
+                # ── Location Filtering Logic ──────────────────────────
+                loc = str(row.get("location", "")).strip()
+                loc_lower = loc.lower()
 
-            new_df   = pd.DataFrame(results)
-            combined = pd.concat([existing, new_df], ignore_index=True)
-            combined.to_excel(excel_path, index=False, engine="openpyxl")
-            # ── Format the Excel ──────────────────────────────────────────
+                # 1. Handle Remote: Change location to Canada
+                if "remote" in loc_lower or "anywhere" in loc_lower:
+                    final_loc = "Canada"
+                else:
+                    final_loc = loc
+
+                # 2. Handle US/Non-Canada locations: Force verdict to 'no'
+                # We only want Canada. If it's US or doesn't contain Canada/Province indicators, mark 'no'
+                is_canada = "canada" in loc_lower or any(p in loc_lower for p in ["ontario", "bc", "alberta", "quebec", "manitoba", "saskatchewan", "nova scotia", "nb", "pei", "nl", " on ", " bc ", " ab ", " qc "])
+                is_us = "usa" in loc_lower or "united states" in loc_lower or "us" == loc_lower.strip()
+
+                if is_us or (not is_canada and not ("remote" in loc_lower or "anywhere" in loc_lower)):
+                    verdict["verdict"] = "no"
+                    verdict["reasoning"] = f"Rejected due to location: {loc}. Only Canada/Remote positions accepted."
+
+                # ── Build new row ─────────────────────────────────
+                matched = verdict.get("matched_skills", [])
+                missing = verdict.get("missing_skills", [])
+
+                def s(v): return self._sanitize_for_excel(str(v)) if hasattr(self, '_sanitize_for_excel') else str(v)
+
+                new_row = {
+                    "AI_recommendation": s(verdict["verdict"]),
+                    "company":           s(row.get("company",     "")),
+                    "title":             s(row.get("title",       "")),
+                    "link":              s(job_url),
+                    "location":          s(final_loc),
+                    "years_required":    s(verdict["years_required"]),
+                    "role_level":        s(verdict["role_level"]),
+                    "skills_match_pct":  s(verdict["skills_match_pct"]),
+                    "matched_skills":    s(", ".join(matched) if isinstance(matched, list) else matched),
+                    "missing_skills":    s(", ".join(missing) if isinstance(missing, list) else missing),
+                    "reasoning":         s(verdict["reasoning"]),
+                    "description":       s(row.get("description", "")),
+                    "posted_date":       s(row.get("date_posted",  "")),
+                }
+
+                # ── Append and save immediately ───────────────────
+                existing_df = pd.concat(
+                    [existing_df, pd.DataFrame([new_row])],
+                    ignore_index=True
+                )
+                if job_url:
+                    processed_urls.add(job_url)
+                processed += 1
+                if verdict["verdict"] == "yes":
+                    yes_count += 1
+
+                try:
+                    existing_df.to_excel(excel_path, index=False, engine="openpyxl")
+                except PermissionError:
+                    self.log_queue.put(("log", "WARNING",
+                        f"⚠ Excel is open — close {excel_path} to allow saving"))
+                except Exception as save_err:
+                    self.log_queue.put(("log", "WARNING", f"Save error: {save_err}"))
+
+                v = verdict["verdict"].upper()
+                self.log_queue.put(("log", "INFO",
+                    f"[{v}] {row.get('title','')} @ {row.get('company','')} "
+                    f"| {verdict['skills_match_pct']}% "
+                    f"| saved ({processed} done, {skipped} skipped)"))
+
+            # ── Format Excel once at end ──────────────────────────
+            self.log_queue.put(("log", "INFO", "Formatting Excel..."))
             try:
                 from openpyxl import load_workbook
                 from openpyxl.styles import PatternFill, Font
@@ -1039,47 +1078,42 @@ class ScraperTab(ctk.CTkFrame):
                 wb = load_workbook(excel_path)
                 ws = wb.active
 
-                # Bold headers + autofilter
                 for cell in ws[1]:
                     cell.font = Font(bold=True, color="FFFFFF")
-                    cell.fill = PatternFill(start_color="1f6feb", end_color="1f6feb", fill_type="solid")
+                    cell.fill = PatternFill(
+                        start_color="1f6feb", end_color="1f6feb", fill_type="solid")
                 ws.auto_filter.ref = ws.dimensions
+                ws.freeze_panes   = "A2"
 
-                # Color fills
                 red_fill    = PatternFill(start_color="FFCCCC", end_color="FFCCCC", fill_type="solid")
                 green_fill  = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
                 yellow_fill = PatternFill(start_color="FFFFCC", end_color="FFFFCC", fill_type="solid")
                 orange_fill = PatternFill(start_color="FFE0B2", end_color="FFE0B2", fill_type="solid")
 
-                # Build header map
-                header_map = {}
-                for cell in ws[1]:
-                    if cell.value:
-                        header_map[str(cell.value).lower()] = cell.column_letter
+                header_map = {
+                    str(cell.value).lower(): cell.column_letter
+                    for cell in ws[1] if cell.value
+                }
 
                 for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
                     for cell in row:
                         col = cell.column_letter
-
                         if col == header_map.get("ai_recommendation"):
                             val = str(cell.value).lower() if cell.value else ""
-                            if val == "yes":    cell.fill = green_fill
-                            elif val == "no":   cell.fill = red_fill
-                            elif val == "maybe":cell.fill = yellow_fill
-
+                            cell.fill = (green_fill  if val == "yes"   else
+                                         red_fill    if val == "no"    else
+                                         yellow_fill if val == "maybe" else cell.fill)
                         if col == header_map.get("skills_match_pct"):
                             try:
                                 pct = int(cell.value)
-                                cell.fill = green_fill  if pct >= 70 else \
-                                            yellow_fill if pct >= 45 else orange_fill
+                                cell.fill = (green_fill  if pct >= 70 else
+                                             yellow_fill if pct >= 45 else orange_fill)
                             except Exception:
                                 pass
-
                         if col == header_map.get("link") and cell.value:
                             cell.hyperlink = cell.value
-                            cell.style = "Hyperlink"
+                            cell.style     = "Hyperlink"
 
-                # Auto-size columns
                 for col_idx in range(1, ws.max_column + 1):
                     col_letter = get_column_letter(col_idx)
                     max_len = max(
@@ -1087,88 +1121,24 @@ class ScraperTab(ctk.CTkFrame):
                     )
                     ws.column_dimensions[col_letter].width = max(10, min(60, max_len + 2))
 
-                # Freeze header row
-                ws.freeze_panes = "A2"
-
                 wb.save(excel_path)
-                self.log_queue.put(("log", "INFO", f"✅ Formatted Excel saved → {excel_path}"))
-            except Exception as e:
-                self.log_queue.put(("log", "WARNING", f"Excel formatting failed: {e}"))
-            yes_count = sum(1 for r in results if r["AI_recommendation"] == "yes")
+                self.log_queue.put(("log", "INFO", f"✅ Excel formatted → {excel_path}"))
+            except Exception as fmt_err:
+                self.log_queue.put(("log", "WARNING", f"Excel formatting failed: {fmt_err}"))
+
             self.log_queue.put(("log", "INFO",
-                f"✅ Done! {len(results)} jobs processed. {yes_count} matched. Saved to {excel_path}"))
+                f"✅ Done! {processed} processed | {yes_count} matched | "
+                f"{skipped} skipped (already in Excel)"))
             self.log_queue.put(("status", "done", f"Done — {yes_count} matches"))
 
         except Exception as e:
+            import traceback
             self.log_queue.put(("log", "ERROR", f"Scraper failed: {e}"))
+            self.log_queue.put(("log", "ERROR", traceback.format_exc()[:300]))
             self.log_queue.put(("status", "error", "Failed"))
 
         self.log_queue.put(("done", None, None))
 
-    def _safe_parse_verdict(self, text: str) -> dict:
-        import re, json
-
-        default = {
-            "verdict": "maybe", "years_required": "unspecified",
-            "role_level": "unspecified", "skills_match_pct": 50,
-            "matched_skills": [], "missing_skills": [],
-            "reasoning": "Could not parse response."
-        }
-
-        if not text or len(text.strip()) < 5:
-            return default
-
-        txt = text.strip()
-
-        # Strip markdown fences
-        if "```" in txt:
-            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", txt, re.IGNORECASE)
-            if m: txt = m.group(1).strip()
-
-        # Fix trailing commas
-        txt = re.sub(r",\s*([}\]])", r"\1", txt)
-
-        # Strategy 1: find complete JSON object anywhere in text
-        brace_start = txt.find("{")
-        brace_end   = txt.rfind("}")
-        if brace_start != -1 and brace_end > brace_start:
-            try:
-                candidate = txt[brace_start:brace_end+1]
-                data = json.loads(candidate)
-                if "verdict" in data:
-                    v = str(data.get("verdict", "maybe")).lower().strip()
-                    if v not in ("yes", "no", "maybe"): v = "maybe"
-                    return {
-                        "verdict":           v,
-                        "years_required":    str(data.get("years_required", "unspecified")),
-                        "role_level":        str(data.get("role_level", "unspecified")).lower(),
-                        "skills_match_pct":  int(data.get("skills_match_pct", 50)),
-                        "matched_skills":    data.get("matched_skills", []),
-                        "missing_skills":    data.get("missing_skills", []),
-                        "reasoning":         str(data.get("reasoning", "")),
-                    }
-            except Exception:
-                pass
-
-        # Strategy 2: regex field extraction
-        def extract(pattern, text, default_val):
-            m = re.search(pattern, text, re.IGNORECASE)
-            return m.group(1) if m else default_val
-
-        verdict = extract(r'"verdict"\s*:\s*"(\w+)"', txt, "maybe").lower()
-        if verdict not in ("yes", "no", "maybe"): verdict = "maybe"
-
-        # Keyword fallback
-        tl = txt.lower()
-        if verdict == "maybe":
-            if '"yes"' in tl or 'verdict: yes' in tl: verdict = "yes"
-            elif '"no"' in tl or 'verdict: no' in tl: verdict = "no"
-
-        default["verdict"]          = verdict
-        default["skills_match_pct"] = int(extract(r'"skills_match_pct"\s*:\s*(\d+)', txt, "50"))
-        default["reasoning"]        = extract(r'"reasoning"\s*:\s*"([^"]*)"', txt, "Auto-scored.")
-
-        return default
 
     def _poll_logs(self):
         while not self.log_queue.empty():
@@ -1186,6 +1156,33 @@ class ScraperTab(ctk.CTkFrame):
                 break
         if self.running:
             self.after(200, self._poll_logs)
+
+    def _sanitize_for_excel(self, value):
+        """Prevent openpyxl crashes by removing illegal XML characters,
+        handling leading '=' and truncating long strings."""
+        if not isinstance(value, str):
+            return value
+
+        # 1. Remove illegal XML characters (control characters)
+        # These characters cause openpyxl to crash during save
+        illegal_xml_chars = [
+            (0x00, 0x08), (0x0B, 0x0C), (0x0E, 0x1F),
+            (0x7F, 0x84), (0x86, 0x9F), (0xFBE, 0xFFB)
+        ]
+        for start, end in illegal_xml_chars:
+            # We use a translation table for efficiency
+            value = value.translate(str.maketrans('', '', ''.join(chr(i) for i in range(start, end + 1))))
+
+        # 2. Excel treats cells starting with '=' as formulas.
+        # Prepend single quote to force string literal in Excel
+        if value.startswith('='):
+            value = "'" + value
+
+        # 3. Excel cell limit is 32,767 characters.
+        if len(value) > 32767:
+            value = value[:32760] + "..."
+
+        return value
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1218,6 +1215,8 @@ class PipelineTab(ctk.CTkFrame):
         self.pipe_fields = {}
         pipe_cfg = [
             ("excel_path",              "Jobs Excel",          "jobs.xlsx"),
+            ("applied_excel_path",      "Applied Excel",       "Job-Tracker.xlsx"),
+            ("applied_folder_path",    "Applied Folder",      "fultime"),
             ("output_dir",              "Output Folder",       "outputs"),
             ("resume_path",             "Resume File",         "resume.txt"),
             ("projects_path",           "Projects File",       "Projects.txt"),
@@ -1617,9 +1616,348 @@ class SettingsTab(ctk.CTkFrame):
             messagebox.showerror("Auth Failed", f"Google auth failed:\n{e}\n\nMake sure credentials.json is in project folder.")
 
 # ══════════════════════════════════════════════════════════════
+#  TAB: Job Tracker
+# ══════════════════════════════════════════════════════════════
+
+class JobDetailWindow(ctk.CTkToplevel):
+    def __init__(self, master, config, job_data, on_save):
+        super().__init__(master)
+        self.title(f"Job Details — {job_data['company']}")
+        self.geometry("700x800")
+        self.grab_set()
+        self.config = config
+        self.job_data = job_data
+        self.on_save = on_save
+
+        self._build()
+
+    def _build(self):
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        # Basic Info
+        info_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        info_frame.pack(fill="x", pady=(0, 20))
+
+        ctk.CTkLabel(info_frame, text=self.job_data.get("title", "N/A"),
+                     font=ctk.CTkFont(size=20, weight="bold")).pack(anchor="w")
+        ctk.CTkLabel(info_frame, text=self.job_data.get("company", "Unknown Company"),
+                     font=ctk.CTkFont(size=16)).pack(anchor="w")
+
+        link = self.job_data.get("link", "")
+        if link:
+            ctk.CTkButton(info_frame, text="Open Job Link ↗", height=28,
+                          command=lambda: os.system(f'start {link}')).pack(anchor="w", pady=10)
+
+        # Verdict Editor
+        v_frame = ctk.CTkFrame(scroll, fg_color="#161b22", corner_radius=8)
+        v_frame.pack(fill="x", pady=10)
+        ctk.CTkLabel(v_frame, text="AI Recommendation:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=15, pady=10)
+        self.verdict_menu = ctk.CTkOptionMenu(v_frame, values=["yes", "maybe", "no"],
+                                             command=lambda v: None)
+        self.verdict_menu.set(self.job_data.get("AI_recommendation", "maybe"))
+        self.verdict_menu.pack(side="left", padx=15, pady=10)
+
+        self.applied_var = ctk.BooleanVar(value=self.job_data.get("application_status") == "Applied")
+        ctk.CTkLabel(v_frame, text="Applied:", font=ctk.CTkFont(weight="bold")).pack(side="left", padx=(20, 5), pady=10)
+        ctk.CTkSwitch(v_frame, text="", variable=self.applied_var).pack(side="left", padx=(0, 15), pady=10)
+
+        ctk.CTkButton(v_frame, text="Save Changes", width=100, height=28,
+                      command=self._save).pack(side="right", padx=15, pady=10)
+
+        # Sections
+        self._add_detail_section(scroll, "Job Description", self.job_data.get("description", "No description available."))
+        self._add_detail_section(scroll, "Matched Skills", self.job_data.get("matched_skills", "None"))
+        self._add_detail_section(scroll, "Missing Skills", self.job_data.get("missing_skills", "None"))
+        self._add_detail_section(scroll, "AI Reasoning", self.job_data.get("reasoning", "No reasoning provided."))
+
+    def _add_detail_section(self, parent, title, content):
+        ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", pady=(15, 5))
+        txt = ctk.CTkTextbox(parent, height=120, font=ctk.CTkFont(size=12), wrap="word")
+        txt.pack(fill="x", pady=(0, 10))
+        txt.insert("1.0", content)
+        txt.configure(state="disabled")
+
+    def _save(self):
+        new_verdict = self.verdict_menu.get()
+        status = "Applied" if self.applied_var.get() else "Not Applied"
+        self.on_save(self.job_data.get("link"), new_verdict, status)
+        self.destroy()
+
+class JobTrackerTab(ctk.CTkFrame):
+    def __init__(self, master, config, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.config = config
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Job Tracker",
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 4), anchor="w", padx=30)
+        ctk.CTkLabel(self, text="Review and manage your AI-screenned opportunities.",
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(anchor="w", padx=30, pady=(0, 15))
+
+        top_bar = ctk.CTkFrame(self, fg_color="transparent")
+        top_bar.pack(fill="x", padx=30, pady=(0, 10))
+
+        ctk.CTkLabel(top_bar, text="Filter by Verdict:").pack(side="left", padx=(0, 10))
+        self.filter_var = ctk.StringVar(value="All")
+        self.filter_menu = ctk.CTkOptionMenu(top_bar, values=["All", "yes", "maybe", "no"],
+                                             variable=self.filter_var, command=self._refresh_list)
+        self.filter_menu.pack(side="left")
+
+        ctk.CTkButton(top_bar, text="🗑 Clear NOs", width=100, height=28,
+                      fg_color="#442222", hover_color="#662222",
+                      command=self._remove_nos).pack(side="right", padx=5)
+        ctk.CTkButton(top_bar, text="🗑 Clear Not Applied", width=120, height=28,
+                      fg_color="#442222", hover_color="#662222",
+                      command=self._remove_not_applied).pack(side="right", padx=5)
+
+        ctk.CTkButton(top_bar, text="🔄 Refresh Data", width=100, height=28,
+                      fg_color="#333", hover_color="#444", command=self._refresh_list).pack(side="right")
+
+        # Table Header
+        header_frame = ctk.CTkFrame(self, fg_color="#161b22", height=40, corner_radius=8)
+        header_frame.pack(fill="x", padx=30, pady=(0, 5))
+
+        cols = [("Verdict", 0.1), ("Company", 0.2), ("Position", 0.3), ("Applied", 0.15), ("Link", 0.25)]
+        for i, (text, weight) in enumerate(cols):
+            lbl = ctk.CTkLabel(header_frame, text=text, font=ctk.CTkFont(weight="bold", size=12),
+                               text_color="#8b949e")
+            lbl.grid(row=0, column=i, sticky="nsew", padx=10)
+
+        header_frame.grid_columnconfigure(0, weight=1)
+        header_frame.grid_columnconfigure(1, weight=2)
+        header_frame.grid_columnconfigure(2, weight=3)
+        header_frame.grid_columnconfigure(3, weight=1)
+        header_frame.grid_columnconfigure(4, weight=2)
+
+        # Table Content
+        self.list_frame = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.list_frame.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+
+        self._refresh_list()
+
+    def _refresh_list(self, *args):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        if not os.path.exists(excel_path):
+            ctk.CTkLabel(self.list_frame, text="No jobs found. Run the scraper first!").pack(pady=20)
+            return
+
+        try:
+            df = pd.read_excel(excel_path)
+            filter_val = self.filter_var.get()
+            if filter_val != "All":
+                df = df[df["AI_recommendation"].str.lower() == filter_val.lower()]
+
+            for idx, row in df.iterrows():
+                self._add_row(row, idx)
+        except Exception as e:
+            ctk.CTkLabel(self.list_frame, text=f"Error loading jobs: {e}", text_color="red").pack(pady=20)
+
+    def _add_row(self, row, idx):
+        row_frame = ctk.CTkFrame(self.list_frame, fg_color="#1c2128", height=45, corner_radius=6)
+        row_frame.pack(fill="x", pady=3)
+        row_frame.grid_columnconfigure(0, weight=1)
+        row_frame.grid_columnconfigure(1, weight=2)
+        row_frame.grid_columnconfigure(2, weight=3)
+        row_frame.grid_columnconfigure(3, weight=1)
+        row_frame.grid_columnconfigure(4, weight=2)
+
+        verdict = str(row.get("AI_recommendation", "")).lower()
+        color = "#238636" if verdict == "yes" else "#d29922" if verdict == "maybe" else "#da3633"
+
+        # 1. Verdict
+        v_lbl = ctk.CTkLabel(row_frame, text=verdict.upper(), text_color=color,
+                              font=ctk.CTkFont(weight="bold", size=11))
+        v_lbl.grid(row=0, column=0, sticky="nsew", padx=10)
+
+        # 2. Company
+        c_lbl = ctk.CTkLabel(row_frame, text=row.get("company", "Unknown"),
+                             font=ctk.CTkFont(size=12))
+        c_lbl.grid(row=0, column=1, sticky="nsew", padx=10)
+
+        # 3. Position
+        p_lbl = ctk.CTkLabel(row_frame, text=row.get("title", "Unknown"),
+                              font=ctk.CTkFont(size=12))
+        p_lbl.grid(row=0, column=2, sticky="nsew", padx=10)
+
+        # 4. Applied Toggle
+        status = row.get("application_status", "Not Applied")
+        is_applied = (status == "Applied")
+
+        app_switch = ctk.CTkSwitch(row_frame, text="",
+                                   width=40, height=20,
+                                   variable=ctk.BooleanVar(value=is_applied),
+                                   command=lambda l=row.get("link"): self._update_application_status(l))
+        app_switch.grid(row=0, column=3, sticky="nsew", padx=10)
+
+        # 5. Link
+        l_lbl = ctk.CTkLabel(row_frame, text="Open ↗", text_color="#58a6ff",
+                              font=ctk.CTkFont(size=11, underline=True))
+        l_lbl.grid(row=0, column=4, sticky="nsew", padx=10)
+
+        # Interaction
+        for widget in [v_lbl, c_lbl, p_lbl, l_lbl, row_frame]:
+            if hasattr(widget, 'bind'):
+                widget.bind("<Button-1>", lambda e, r=row: self._open_details(r))
+
+    def _open_details(self, row):
+        JobDetailWindow(self, self.config, row.to_dict(), self._update_verdict)
+
+    def _migrate_to_applied(self, job_link):
+        """
+        Moves a job record from jobs.xlsx to Job-Tracker.xlsx and
+        moves generated files to the structured applied folder.
+        """
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        applied_excel = self.config.get("pipeline", "applied_excel_path", default="Job-Tracker.xlsx")
+        applied_folder_root = self.config.get("pipeline", "applied_folder_path", default="fultime")
+        output_root = self.config.get("pipeline", "output_dir", default="outputs")
+
+        try:
+            df = pd.read_excel(excel_path)
+            job_row = df[df["link"] == job_link]
+
+            if job_row.empty:
+                logging.warning(f"Migration failed: No job found with link {job_link}")
+                return False
+
+            # 1. Data Migration
+            record = job_row.iloc[0].to_frame().T
+
+            # Load or create Job-Tracker.xlsx
+            if os.path.exists(applied_excel):
+                app_df = pd.read_excel(applied_excel)
+                app_df = pd.concat([app_df, record], ignore_index=True)
+            else:
+                app_df = record
+
+            app_df.to_excel(applied_excel, index=False)
+
+            # Remove from main jobs.xlsx
+            df = df[df["link"] != job_link]
+            df.to_excel(excel_path, index=False)
+
+            # 2. File Migration
+            company = str(job_row.iloc[0].get("company", "Unknown_Company"))
+            title = str(job_row.iloc[0].get("title", "Unknown_Position"))
+
+            def sanitize(name):
+                import re
+                name = re.sub(r"[^\w\s-]", "", name)
+                return re.sub(r"\s+", "_", name.strip())[:60] or "Unknown"
+
+            company_s = sanitize(company)
+            title_s = sanitize(title)
+            date_str = datetime.now().strftime("%Y-%m-%d")
+
+            src_dir = os.path.join(output_root, company_s, title_s)
+            dest_dir = os.path.join(applied_folder_root, company_s, f"{title_s}_{date_str}")
+
+            logging.info(f"Attempting to move files: {src_dir} -> {dest_dir}")
+
+            if os.path.exists(src_dir):
+                os.makedirs(os.path.dirname(dest_dir), exist_ok=True)
+                shutil.move(src_dir, dest_dir)
+                logging.info(f"Successfully moved files to {dest_dir}")
+            else:
+                logging.warning(f"Source directory not found: {src_dir}. Files might not have been generated.")
+
+            return True
+        except Exception as e:
+            logging.error(f"Migration failed with error: {e}")
+            return False
+
+    def _update_application_status(self, job_link):
+        if not job_link: return
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        try:
+            df = pd.read_excel(excel_path)
+
+            if "application_status" not in df.columns:
+                df["application_status"] = "Not Applied"
+            else:
+                # Ensure the column is object/string type to avoid dtype errors when setting 'Applied'
+                df["application_status"] = df["application_status"].astype(str)
+
+            current_status = df.loc[df["link"] == job_link, "application_status"].values
+            # Toggle status
+            new_status = "Applied" if len(current_status) == 0 or current_status[0] != "Applied" else "Not Applied"
+
+            df.loc[df["link"] == job_link, "application_status"] = new_status
+            df.to_excel(excel_path, index=False)
+
+            if new_status == "Applied":
+                if self._migrate_to_applied(job_link):
+                    messagebox.showinfo("Applied", f"Job moved to {self.config.get('pipeline', 'applied_excel_path')} and files archived.")
+                else:
+                    messagebox.showwarning("Partial Success", "Updated status, but could not migrate files/record.")
+
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not update application status: {e}")
+
+    def _update_verdict(self, job_link, new_verdict, status="Not Applied"):
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        try:
+            df = pd.read_excel(excel_path)
+            # Ensure columns are string types to prevent dtype errors
+            if "AI_recommendation" in df.columns:
+                df["AI_recommendation"] = df["AI_recommendation"].astype(str)
+            if "application_status" in df.columns:
+                df["application_status"] = df["application_status"].astype(str)
+            else:
+                df["application_status"] = "Not Applied"
+
+            df.loc[df["link"] == job_link, "AI_recommendation"] = new_verdict
+            df.loc[df["link"] == job_link, "application_status"] = status
+            df.to_excel(excel_path, index=False)
+
+            if status == "Applied":
+                self._migrate_to_applied(job_link)
+
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not update record: {e}")
+
+    def _remove_nos(self):
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        if not os.path.exists(excel_path): return
+        try:
+            df = pd.read_excel(excel_path)
+            original_count = len(df)
+            df = df[df["AI_recommendation"].str.lower() != "no"]
+            df.to_excel(excel_path, index=False)
+            messagebox.showinfo("Cleaned", f"Removed {original_count - len(df)} records with 'No' verdict.")
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not remove NOs: {e}")
+
+    def _remove_not_applied(self):
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        if not os.path.exists(excel_path): return
+        try:
+            df = pd.read_excel(excel_path)
+            # Ensure column exists
+            if "application_status" not in df.columns:
+                df["application_status"] = "Not Applied"
+
+            original_count = len(df)
+            df = df[df["application_status"] != "Not Applied"]
+            df.to_excel(excel_path, index=False)
+            messagebox.showinfo("Cleaned", f"Removed {original_count - len(df)} records not yet applied.")
+            self._refresh_list()
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not remove Not Applied: {e}")
+
+# ══════════════════════════════════════════════════════════════
 #  TAB: Logs
 # ══════════════════════════════════════════════════════════════
 class LogsTab(ctk.CTkFrame):
+
     def __init__(self, master, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self._build()
@@ -1738,37 +2076,10 @@ class ResumeTab(ctk.CTkFrame):
         else:
             roles = [
                 {
-                    "title":       "Support Consultant",
-                    "company":     "Nova Scotia Health Authority",
-                    "dates":       "Feb 2026 – Present",
-                    "domain":      "healthcare IT, systems, user support",
-                    "total_bullets":  5,
-                    "real_bullets":   2,
-                    "fabricated_bullets": 3,
-                },
-                {
-                    "title":       "Software Developer",
-                    "company":     "TeleAI Corporation",
-                    "dates":       "Jan 2025 – May 2025",
-                    "domain":      "AI/ML, full-stack, APIs",
-                    "total_bullets":  4,
-                    "real_bullets":   2,
-                    "fabricated_bullets": 2,
-                },
-                {
-                    "title":       "R&D Project Engineer",
-                    "company":     "MyTech Lab",
-                    "dates":       "Sept 2024 – Dec 2024",
-                    "domain":      "research, algorithms, optimization",
-                    "total_bullets":  3,
-                    "real_bullets":   1,
-                    "fabricated_bullets": 2,
-                },
-                {
-                    "title":       "Full-Stack Developer",
-                    "company":     "Webforest LLP",
-                    "dates":       "Jan 2023 – Jul 2023",
-                    "domain":      "web development, databases, deployment",
+                    "title":       "Job Title",
+                    "company":     "Company Name",
+                    "dates":       "Month Year – Month Year",
+                    "domain":      "Your Domain",
                     "total_bullets":  4,
                     "real_bullets":   2,
                     "fabricated_bullets": 2,
@@ -1967,6 +2278,13 @@ class JobHunterApp(ctk.CTk):
         logging.getLogger().addHandler(handler)
         logging.getLogger().setLevel(logging.INFO)
 
+        # Add file logging
+        file_handler = logging.FileHandler("ai_logs.log", encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        logging.getLogger().addHandler(file_handler)
+
+        self._start_log_monitor()
+
         # ← ADD THIS
         check_and_run_setup(self, self.config, on_complete=self._build_ui)
         # Only build UI if already configured (wizard calls on_complete itself)
@@ -1999,6 +2317,7 @@ class JobHunterApp(ctk.CTk):
             ("Dashboard",  "🏠"),
             ("Scraper",    "🔍"),
             ("Pipeline",   "⚙"),
+            ("Job Tracker", "📊"),
             ("Profile",    "👤"),   # ← ADD
             ("Resume",     "📄"),
             ("Prompts",    "✏"),
@@ -2015,7 +2334,7 @@ class JobHunterApp(ctk.CTk):
         sidebar.grid_columnconfigure(0, weight=1)
 
         # Version info at bottom
-        ctk.CTkLabel(sidebar, text="Built for Sneh Patel",
+        ctk.CTkLabel(sidebar, text="JobHunter AI",
                      font=ctk.CTkFont(size=10), text_color="#444").grid(
             row=11, column=0, padx=16, pady=(0, 8), sticky="sw")
 
@@ -2030,6 +2349,7 @@ class JobHunterApp(ctk.CTk):
             "Dashboard": DashboardTab(self.content, self.config),
             "Scraper":   ScraperTab(self.content, self.config, self.log_queue),
             "Pipeline":  PipelineTab(self.content, self.config, self.log_queue),
+            "Job Tracker": JobTrackerTab(self.content, self.config),
             "Profile":   ProfileTab(self.content, self.config),   # ← ADD
             "Resume":    ResumeTab(self.content, self.config),
             "Prompts":   PromptsTab(self.content, self.config),
