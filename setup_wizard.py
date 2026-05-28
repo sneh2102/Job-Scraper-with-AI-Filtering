@@ -63,14 +63,14 @@ def load_profile(config_file="app_config.json") -> dict:
     return defaults
 
 
-def build_fixed_header(profile: dict) -> str:
+def build_fixed_header(profile: dict, location_override: str = None) -> str:
     """Generate the LaTeX header block from profile data."""
     name     = profile.get("full_name",  "Your Name")
     phone    = profile.get("phone",      "+1 000-000-0000")
     email    = profile.get("email",      "your@email.com")
     linkedin = profile.get("linkedin",   "")
     github   = profile.get("github",     "")
-    location = profile.get("location",   "Your City, Province, Country")
+    location = location_override or profile.get("location",   "Your City, Province, Country")
 
     # Build contact line
     contact_parts = []

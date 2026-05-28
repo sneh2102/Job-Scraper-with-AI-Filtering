@@ -56,8 +56,8 @@ DEFAULT_CONFIG = {
         "name": "gemma4:31b-cloud",
         "api_keys": [],
         "use_cloud": True,
-        "num_predict": 16384,
-        "num_ctx": 32768,
+        "num_predict": 32768,
+        "num_ctx": 65536,
         "temperature": 0.3,
     },
     "pipeline": {
@@ -973,8 +973,8 @@ class ScraperTab(ctk.CTkFrame):
                     prompt = (
                         prompt_template
                         .replace("{title}",       str(row.get("title", "N/A")))
-                        .replace("{description}", clean_desc[:2500])
-                        .replace("{resume_text}", resume_text[:1500])
+                        .replace("{description}", clean_desc)
+                        .replace("{resume_text}", resume_text)
                     ) + SCHEMA_SUFFIX
 
                     # Rotating API keys via environment variable for the assistant
@@ -1002,25 +1002,6 @@ class ScraperTab(ctk.CTkFrame):
                         "reasoning": f"AI error: {err_str[:100]}",
                     }
 
-                # ── Location Filtering Logic ──────────────────────────
-                loc = str(row.get("location", "")).strip()
-                loc_lower = loc.lower()
-
-                # 1. Handle Remote: Change location to Canada
-                if "remote" in loc_lower or "anywhere" in loc_lower:
-                    final_loc = "Canada"
-                else:
-                    final_loc = loc
-
-                # 2. Handle US/Non-Canada locations: Force verdict to 'no'
-                # We only want Canada. If it's US or doesn't contain Canada/Province indicators, mark 'no'
-                is_canada = "canada" in loc_lower or any(p in loc_lower for p in ["ontario", "bc", "alberta", "quebec", "manitoba", "saskatchewan", "nova scotia", "nb", "pei", "nl", " on ", " bc ", " ab ", " qc "])
-                is_us = "usa" in loc_lower or "united states" in loc_lower or "us" == loc_lower.strip()
-
-                if is_us or (not is_canada and not ("remote" in loc_lower or "anywhere" in loc_lower)):
-                    verdict["verdict"] = "no"
-                    verdict["reasoning"] = f"Rejected due to location: {loc}. Only Canada/Remote positions accepted."
-
                 # ── Build new row ─────────────────────────────────
                 matched = verdict.get("matched_skills", [])
                 missing = verdict.get("missing_skills", [])
@@ -1032,7 +1013,7 @@ class ScraperTab(ctk.CTkFrame):
                     "company":           s(row.get("company",     "")),
                     "title":             s(row.get("title",       "")),
                     "link":              s(job_url),
-                    "location":          s(final_loc),
+                    "location":          s(row.get("location", "")),
                     "years_required":    s(verdict["years_required"]),
                     "role_level":        s(verdict["role_level"]),
                     "skills_match_pct":  s(verdict["skills_match_pct"]),
@@ -2287,9 +2268,6 @@ class JobHunterApp(ctk.CTk):
 
         # ← ADD THIS
         check_and_run_setup(self, self.config, on_complete=self._build_ui)
-        # Only build UI if already configured (wizard calls on_complete itself)
-        if self.config.get("setup_complete", default=False):
-            self._build_ui()
 
     def _build_ui(self):
         self.grid_columnconfigure(1, weight=1)

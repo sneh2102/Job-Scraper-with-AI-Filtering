@@ -462,7 +462,7 @@ class ResumeBuilderAgent:
         self.existing_resume = existing_resume
 
     # ── Main build — 4 separate API calls ────────────────────
-    def build(self, title: str, company: str, description: str, ats_feedback="") -> tuple[str, str]:
+    def build(self, title: str, company: str, description: str, ats_feedback="", location="") -> tuple[str, str]:
         fb        = self._parse_ats_feedback(ats_feedback)
         safe_desc = self._safe(description)
         profile   = _load_profile()
@@ -477,7 +477,8 @@ class ResumeBuilderAgent:
 
         # Build Header and Education from profile
         profile = load_profile()
-        header = build_fixed_header(profile)
+        extracted_loc = self._extract_location(description, location)
+        header = build_fixed_header(profile, location_override=extracted_loc)
 
         edu_list = profile.get("education", [])
         if edu_list:
@@ -660,8 +661,8 @@ RULES:
 
     # ── Location extractor ────────────────────────────────────
     @staticmethod
-    def _extract_location(description: str) -> str:
-        desc_lower = description.lower()
+    def _extract_location(description: str, location_field: str = "") -> str | None:
+        text_to_search = (description + " " + location_field).lower()
         city_map = {
             "toronto":       "Toronto, ON, Canada",
             "vancouver":     "Vancouver, BC, Canada",
@@ -674,28 +675,13 @@ RULES:
             "waterloo":      "Waterloo, ON, Canada",
             "kitchener":     "Kitchener, ON, Canada",
             "moncton":       "Moncton, NB, Canada",
-            "new york":      "New York, NY, USA",
-            "san francisco": "San Francisco, CA, USA",
-            "seattle":       "Seattle, WA, USA",
-            "austin":        "Austin, TX, USA",
-            "bangalore":     "Bangalore, India",
-            "mumbai":        "Mumbai, India",
-            "delhi":         "Delhi, India",
-            "hyderabad":     "Hyderabad, India",
-            "chennai":       "Chennai, India",
-            "Pune":          "Pune, India",
-            "Gurgaon":       "Gurgaon, India",
-            "noida":        "Noida, India",
-            "Surat":        "Surat, India",
-            "Ahmedabad":    "Ahmedabad, India",
-            "kolkata":      "Kolkata, India"
         }
         for city, formatted in city_map.items():
-            if city in desc_lower:
+            if city in text_to_search:
                 return formatted
-        if any(x in desc_lower for x in ["remote", "Canada-wide", "anywhere in canada", "work from home"]):
+        if any(x in text_to_search for x in ["remote", "canada-wide", "anywhere in canada", "work from home"]) and "canada" in text_to_search:
             return "Canada"
-        return "Canada"
+        return None
 
     # ── Helpers ───────────────────────────────────────────────
     @staticmethod

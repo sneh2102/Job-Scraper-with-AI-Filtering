@@ -235,7 +235,8 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
     logger.info("=" * 60)
 
     latex, cover_letter = builder.build(
-        title=title, company=company, description=description
+        title=title, company=company, description=description,
+        location=str(row.get("location", ""))
     )
 
     ats_result  = {}
