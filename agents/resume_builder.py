@@ -462,7 +462,7 @@ class ResumeBuilderAgent:
         self.existing_resume = existing_resume
 
     # ── Main build — 4 separate API calls ────────────────────
-    def build(self, title: str, company: str, description: str, ats_feedback="", location="") -> tuple[str, str]:
+    def build(self, title: str, company: str, description: str, ats_feedback="", location="", use_jd_location=True, default_location="Canada") -> tuple[str, str]:
         fb        = self._parse_ats_feedback(ats_feedback)
         safe_desc = self._safe(description)
         profile   = _load_profile()
@@ -477,8 +477,13 @@ class ResumeBuilderAgent:
 
         # Build Header and Education from profile
         profile = load_profile()
-        extracted_loc = self._extract_location(description, location)
-        header = build_fixed_header(profile, location_override=extracted_loc)
+        if use_jd_location:
+            location_override = self._extract_location(description, location)
+            if not location_override:
+                location_override = default_location
+        else:
+            location_override = default_location
+        header = build_fixed_header(profile, location_override=location_override)
 
         edu_list = profile.get("education", [])
         if edu_list:

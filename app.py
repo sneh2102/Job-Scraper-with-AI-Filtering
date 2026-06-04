@@ -71,6 +71,8 @@ DEFAULT_CONFIG = {
         "projects_path": "Projects.txt",
         "resume_filename": "Resume",
         "cover_letter_filename": "Cover_Letter",
+        "use_jd_location": True,
+        "default_location": "Canada",
     },
     "google": {
         "enabled": False,
@@ -764,6 +766,24 @@ class DashboardTab(ctk.CTkFrame):
 
         ctk.CTkFrame(guide, height=15, fg_color="transparent").pack()
 
+        # Start All Button
+        start_all_frame = ctk.CTkFrame(self, fg_color="transparent")
+        start_all_frame.pack(fill="x", padx=30, pady=20)
+
+        self.start_all_btn = ctk.CTkButton(
+            start_all_frame, text="🚀 Start All (Scrape → Pipeline)",
+            height=48, font=ctk.CTkFont(size=15, weight="bold"),
+            command=self._start_all
+        )
+        self.start_all_btn.pack(fill="x")
+
+    def _start_all(self):
+        app = self.master.master
+        if hasattr(app, 'tabs') and "Scraper" in app.tabs:
+            scraper = app.tabs["Scraper"]
+            scraper.chain_to_pipeline = True
+            scraper._run()
+
     def _stat_card(self, parent, icon, label, value, col):
         card = ctk.CTkFrame(parent, corner_radius=10, width=160, height=90)
         card.grid(row=0, column=col, padx=8, sticky="ew")
@@ -785,6 +805,8 @@ class ScraperTab(ctk.CTkFrame):
         self.config    = config
         self.log_queue = log_queue
         self.running   = False
+        self.stop_event = threading.Event()
+        self.chain_to_pipeline = False
         self._build()
 
     def _build(self):
@@ -844,6 +866,15 @@ class ScraperTab(ctk.CTkFrame):
         )
         self.run_btn.pack(padx=15, fill="x")
 
+        self.stop_btn = ctk.CTkButton(
+            right, text="⏹  Stop Scraping", height=42,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#442222", hover_color="#662222",
+            command=self._stop_scraping,
+            state="disabled"
+        )
+        self.stop_btn.pack(padx=15, pady=(10, 0), fill="x")
+
         ctk.CTkLabel(right, text="Live Output:",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(padx=15, pady=(10, 2), anchor="w")
 
@@ -870,12 +901,19 @@ class ScraperTab(ctk.CTkFrame):
         if self.running:
             return
         self._save_config()
+        self.stop_event.clear()
         self.running = True
         self.run_btn.configure(state="disabled", text="⏳  Running...")
+        self.stop_btn.configure(state="normal")
         self.status.set_status("running", "Scraping...")
         self.log_widget.clear()
         threading.Thread(target=self._scrape_thread, daemon=True).start()
         self.after(200, self._poll_logs)
+
+    def _stop_scraping(self):
+        self.log_widget.append("WARNING", "Stopping scraper... (finishing current job)")
+        self.stop_event.set()
+        self.stop_btn.configure(state="disabled")
 
     def _scrape_thread(self):
         try:
@@ -958,6 +996,9 @@ class ScraperTab(ctk.CTkFrame):
 
             # ── ONE loop — process each job and save immediately ──
             for _, row in jobs.iterrows():
+                if self.stop_event.is_set():
+                    self.log_queue.put(("log", "WARNING", "🛑 Stop signal received. Finishing current item and exiting..."))
+                    break
                 job_url = str(row.get("job_url", "")).strip()
 
                 # Skip already-saved URLs
@@ -1132,6 +1173,13 @@ class ScraperTab(ctk.CTkFrame):
                 elif kind == "done":
                     self.running = False
                     self.run_btn.configure(state="normal", text="▶  Start Scraping")
+                    self.stop_btn.configure(state="disabled")
+                    if self.chain_to_pipeline:
+                        self.log_widget.append("INFO", "⛓ Chaining to Pipeline...")
+                        self.chain_to_pipeline = False
+                        app = self.master.master
+                        if hasattr(app, 'tabs') and "Pipeline" in app.tabs:
+                            app.tabs["Pipeline"]._run()
                     return
             except queue.Empty:
                 break
@@ -1175,6 +1223,7 @@ class PipelineTab(ctk.CTkFrame):
         self.config    = config
         self.log_queue = log_queue
         self.running   = False
+        self.stop_event = threading.Event()
         self._build()
 
     def _build(self):
@@ -1202,7 +1251,8 @@ class PipelineTab(ctk.CTkFrame):
             ("resume_path",             "Resume File",         "resume.txt"),
             ("projects_path",           "Projects File",       "Projects.txt"),
             ("resume_filename",         "Resume Filename",     "Sneh_Resume"),        # ← ADD
-            ("cover_letter_filename",   "Cover Letter Name",   "Sneh_Cover_Letter"),  # ← ADD
+            ("cover_letter_filename",   "Cover Letter Name",   "Sneh_Cover_Letter"),  # ← ADD,
+            ("default_location",    "Default Location",    "Canada"),
             ]
         for key, label, ph in pipe_cfg:
             row = ctk.CTkFrame(left, fg_color="transparent")
@@ -1216,6 +1266,14 @@ class PipelineTab(ctk.CTkFrame):
                                 command=lambda e=entry, k=key: self._browse(e, k))
             btn.pack(side="left", padx=(3, 0))
             self.pipe_fields[key] = entry
+
+
+        # Location Setting
+        self.use_jd_loc_var = ctk.BooleanVar(value=self.config.get("pipeline", "use_jd_location", default=True))
+        loc_row = ctk.CTkFrame(left, fg_color="transparent")
+        loc_row.pack(fill="x", padx=15, pady=4)
+        ctk.CTkLabel(loc_row, text="Use JD Location", width=110, anchor="w").pack(side="left")
+        ctk.CTkSwitch(loc_row, variable=self.use_jd_loc_var, text="").pack(side="left")
 
         # ATS settings
         ctk.CTkLabel(left, text="ATS Settings",
@@ -1258,6 +1316,15 @@ class PipelineTab(ctk.CTkFrame):
         )
         self.run_btn.pack(padx=15, fill="x")
 
+        self.stop_btn = ctk.CTkButton(
+            right, text="⏹  Stop Pipeline", height=42,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            fg_color="#442222", hover_color="#662222",
+            command=self._stop_pipeline,
+            state="disabled"
+        )
+        self.stop_btn.pack(padx=15, pady=(10, 0), fill="x")
+
         ctk.CTkLabel(right, text="Live Output:",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(padx=15, pady=(10, 2), anchor="w")
 
@@ -1284,18 +1351,26 @@ class PipelineTab(ctk.CTkFrame):
         self.config.save()
         self.log_widget.append("INFO", "✓ Pipeline config saved.")
 
+        self.config.set("pipeline", "use_jd_location", self.use_jd_loc_var.get())
     def _run(self):
         if self.running:
             return
         self._save_config()
+        self.stop_event.clear()
         self.running = True
         self.run_btn.configure(state="disabled", text="⏳  Running...")
+        self.stop_btn.configure(state="normal")
         self.status.set_status("running", "Processing...")
         self.log_widget.clear()
 
         q = self.log_queue
         threading.Thread(target=self._pipeline_thread, args=(q,), daemon=True).start()
         self.after(200, self._poll_logs)
+
+    def _stop_pipeline(self):
+        self.log_widget.append("WARNING", "Stopping pipeline... (finishing current job)")
+        self.stop_event.set()
+        self.stop_btn.configure(state="disabled")
 
     def _pipeline_thread(self, q):
         try:
@@ -1307,7 +1382,7 @@ class PipelineTab(ctk.CTkFrame):
             self._inject_prompts()
 
             from pipeline import main as pipeline_main
-            pipeline_main()
+            pipeline_main(stop_event=self.stop_event)
 
             q.put(("log", "INFO", "✅ Pipeline complete!"))
             q.put(("status", "done", "Done"))
@@ -1368,6 +1443,7 @@ class PipelineTab(ctk.CTkFrame):
                     self.running = False
                     self.run_btn.configure(state="normal",
                                            text="▶  Generate Resumes & Cover Letters")
+                    self.stop_btn.configure(state="disabled")
                     return
             except queue.Empty:
                 break

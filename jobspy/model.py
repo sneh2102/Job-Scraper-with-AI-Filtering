@@ -56,7 +56,6 @@ class JobType(Enum):
     SUMMER = ("summer",)
     VOLUNTEER = ("volunteer",)
 
-
 class Country(Enum):
     """
     Gets the subdomain for Indeed and Glassdoor.
@@ -177,7 +176,6 @@ class Country(Enum):
             f"Invalid country string: '{country_str}'. Valid countries are: {', '.join([country[0] for country in valid_countries])}"
         )
 
-
 class Location(BaseModel):
     country: Country | str | None = None
     city: Optional[str] = None
@@ -204,7 +202,6 @@ class Location(BaseModel):
                 location_parts.append(country_name.title())
         return ", ".join(location_parts)
 
-
 class CompensationInterval(Enum):
     YEARLY = "yearly"
     MONTHLY = "monthly"
@@ -223,13 +220,11 @@ class CompensationInterval(Enum):
         else:
             return cls[pay_period].value if pay_period in cls.__members__ else None
 
-
 class Compensation(BaseModel):
     interval: Optional[CompensationInterval] = None
     min_amount: float | None = None
     max_amount: float | None = None
     currency: Optional[str] = "USD"
-
 
 class DescriptionFormat(Enum):
     MARKDOWN = "markdown"
@@ -283,7 +278,6 @@ class JobPost(BaseModel):
 class JobResponse(BaseModel):
     jobs: list[JobPost] = []
 
-
 class Site(Enum):
     LINKEDIN = "linkedin"
     INDEED = "indeed"
@@ -295,11 +289,9 @@ class Site(Enum):
     BDJOBS = "bdjobs"  # Add this line
     JOBRIGHT     = "jobright"   # ← ADD THIS
 
-
 class SalarySource(Enum):
     DIRECT_DATA = "direct_data"
     DESCRIPTION = "description"
-
 
 class ScraperInput(BaseModel):
     site_type: list[Site]
@@ -321,7 +313,6 @@ class ScraperInput(BaseModel):
 
     results_wanted: int = 15
     hours_old: int | None = None
-
 
 class Scraper(ABC):
     def __init__(

@@ -208,7 +208,7 @@ def _reassemble_latex(body: dict) -> str:
 # CORE JOB PROCESSOR
 # ══════════════════════════════════════════════════════════════
 
-def process_job(row, builder, checker, output_base, use_pdflatex,
+def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_location=True, default_location="Canada",
                 max_iterations: int = None, pass_threshold: int = None):
     _max_iter  = max_iterations if max_iterations is not None else MAX_ATS_ITERATIONS
     _threshold = pass_threshold if pass_threshold is not None else ATS_PASS_THRESHOLD
@@ -236,8 +236,8 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
 
     latex, cover_letter = builder.build(
         title=title, company=company, description=description,
-        location=str(row.get("location", ""))
-    )
+        location=str(row.get("location", "")),
+                use_jd_location=use_jd_location, default_location=default_location    )
 
     ats_result  = {}
     final_score = 0
@@ -354,7 +354,7 @@ def process_job(row, builder, checker, output_base, use_pdflatex,
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-def main():
+def main(stop_event=None):
     global MAX_ATS_ITERATIONS, ATS_PASS_THRESHOLD
 
     load_env(".env")
@@ -413,10 +413,13 @@ def main():
 
     results = []
     for idx, row in yes_jobs.iterrows():
+        if stop_event and stop_event.is_set():
+            logger.info("🛑 Pipeline stopped by user.")
+            break
         try:
             result = process_job(
-                row, builder, checker, output_dir, use_pdflatex,
-                max_iterations=max_iterations,
+                row, builder, checker, output_dir, use_pdflatex, use_jd_location=pipe_cfg.get("use_jd_location", True), 
+                default_location=pipe_cfg.get("default_location", "Canada"),                max_iterations=max_iterations,
                 pass_threshold=pass_threshold,
             )
             result["job_url"]  = str(row.get("link",     ""))

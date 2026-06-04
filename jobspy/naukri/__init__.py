@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json as _json
 import math
 import random
 import time
@@ -7,315 +8,414 @@ from datetime import datetime, date, timedelta
 from typing import Optional
 from jobspy.naukri.cookie_fetcher import get_naukri_headers
 import regex as re
-import requests
-from jobspy.naukri.cookie_fetcher import get_naukri_headers
-from jobspy.exception import NaukriException
+from bs4 import BeautifulSoup
 from jobspy.naukri.constant import headers as naukri_headers
-from jobspy.naukri.util import (
-    is_job_remote,
-    parse_job_type,
-    parse_company_industry,
-)
+from jobspy.naukri.util import is_job_remote, parse_job_type, parse_company_industry
 from jobspy.model import (
-    JobPost,
-    Location,
-    JobResponse,
-    Country,
-    Compensation,
-    DescriptionFormat,
-    Scraper,
-    ScraperInput,
-    Site,
+    JobPost, Location, JobResponse, Country,
+    Compensation, DescriptionFormat, Scraper, ScraperInput, Site,
 )
 from jobspy.util import (
     extract_emails_from_text,
-    currency_parser,
-    markdown_converter,
-    create_session,
-    create_logger,
+    markdown_converter, create_session, create_logger,
 )
 
 log = create_logger("Naukri")
 
+_STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+    Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
+    window.chrome = { runtime: {} };
+"""
+
+_DESC_SELECTORS = [
+    '[class*="job-desc-container"]',
+    '[class*="jdc_content"]',
+    '[class*="dang-inner-html"]',
+    '[class*="jd-desc"]',
+    '[class*="job-desc"]',
+    'section[class*="desc"]',
+]
+
+
 class Naukri(Scraper):
-    base_url = "https://www.naukri.com/jobapi/v3/search"
-    delay = 3
-    band_delay = 4
-    jobs_per_page = 20  
+    base_url      = "https://www.naukri.com/jobapi/v3/search"
+    delay         = 2
+    band_delay    = 3
+    jobs_per_page = 20
 
-    
+    # ── Set to False to hide the browser window during description fetching.
+    #    Naukri detects headless mode and blocks pages, so visible is required.
+    HEADLESS_DETAIL = False
 
-    # Change import
-    
-
-    # Change __init__ method
     def __init__(self, proxies=None, ca_cert=None, user_agent=None):
         super().__init__(Site.NAUKRI, proxies=proxies, ca_cert=ca_cert)
         self.session = create_session(
-            proxies=self.proxies,
-            ca_cert=ca_cert,
-            is_tls=False,
-            has_retry=True,
-            delay=5,
-            clear_cookies=False,
+            proxies=self.proxies, ca_cert=ca_cert,
+            is_tls=False, has_retry=True, delay=5, clear_cookies=False,
         )
+        self._desc_cache: dict[str, str] = {}
+        self._browser_cookies: list[dict] = []
+        self._pw_context = None
+        self._pw_page    = None      # single reused tab
+        self._pw_instance = None
 
-        # Get real headers via browser interception
         try:
-            log.info("Intercepting Naukri API headers via browser...")
-            real_headers = get_naukri_headers()
-            if real_headers:
-                # Merge captured headers over our base headers
-                merged = {**naukri_headers, **real_headers}
-                self.session.headers.update(merged)
-                log.info(f"Got {len(real_headers)} real headers from Naukri")
+            log.info("Capturing Naukri session via browser...")
+            result = get_naukri_headers()
+
+            if isinstance(result, dict):
+                headers, cookies, cached = result, {}, {}
+            elif isinstance(result, (tuple, list)):
+                if len(result) >= 4:
+                    headers, cached, cookies = result[0], result[1], result[2]
+                elif len(result) == 2:
+                    headers, cookies, cached = result[0], result[1], {}
+                else:
+                    headers, cookies, cached = {}, {}, {}
             else:
-                log.warning("No headers captured, using fallback")
-                self.session.headers.update(naukri_headers)
+                headers, cookies, cached = {}, {}, {}
+
+            self._desc_cache = cached or {}
+            merged = {**naukri_headers, **headers}
+            self.session.headers.update(merged)
+            for name, value in (cookies or {}).items():
+                self.session.cookies.set(name, value, domain=".naukri.com")
+            self._browser_cookies = [
+                {"name": n, "value": v, "domain": ".naukri.com", "path": "/"}
+                for n, v in (cookies or {}).items()
+            ]
+            self._has_nkparam = "nkparam" in merged
+            log.info(
+                f"Ready | headers={len(merged)} | cookies={len(cookies or {})} | "
+                f"nkparam={'✓' if self._has_nkparam else '✗'} | pre-cached={len(self._desc_cache)}"
+            )
         except Exception as e:
-            log.warning(f"Could not capture Naukri headers: {e}")
+            log.warning(f"Header capture failed: {e}")
             self.session.headers.update(naukri_headers)
+            self._has_nkparam = False
 
         self.scraper_input = None
-        self.country = "India"
-        log.info("Naukri scraper initialized")
+
+    # ══════════════════════════════════════════════════════════
+    # PLAYWRIGHT — single visible browser + single reused tab
+    # ══════════════════════════════════════════════════════════
+
+    def _start_playwright(self):
+        try:
+            from playwright.sync_api import sync_playwright
+            self._pw_instance = sync_playwright().start()
+            browser = self._pw_instance.chromium.launch(
+                headless=self.HEADLESS_DETAIL,
+                args=["--disable-blink-features=AutomationControlled","--no-sandbox","--disable-dev-shm-usage"],
+            )
+            self._pw_context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 900},
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            )
+            self._pw_context.add_init_script(_STEALTH_SCRIPT)
+            if self._browser_cookies:
+                self._pw_context.add_cookies(self._browser_cookies)
+            # One reusable tab for all jobs (only one window pops up)
+            self._pw_page = self._pw_context.new_page()
+            log.info(f"Playwright ready (headless={self.HEADLESS_DETAIL}) | "
+                     f"{len(self._browser_cookies)} cookies restored")
+        except Exception as e:
+            log.warning(f"Could not start Playwright: {e}")
+            self._pw_context = None
+            self._pw_page    = None
+
+    def _stop_playwright(self):
+        try:
+            if self._pw_instance:
+                self._pw_instance.stop()
+                log.info("Playwright stopped")
+        except Exception:
+            pass
+        finally:
+            self._pw_context = self._pw_page = self._pw_instance = None
+
+    # ══════════════════════════════════════════════════════════
+    # SCRAPE
+    # ══════════════════════════════════════════════════════════
 
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
-        """
-        Scrapes Naukri API for jobs with scraper_input criteria
-        :param scraper_input:
-        :return: job_response
-        """
         self.scraper_input = scraper_input
-        job_list: list[JobPost] = []
-        seen_ids = set()
-        start = scraper_input.offset or 0
-        page = (start // self.jobs_per_page) + 1
-        request_count = 0
-        seconds_old = (
-            scraper_input.hours_old * 3600 if scraper_input.hours_old else None
-        )
-        continue_search = (
-            lambda: len(job_list) < scraper_input.results_wanted and page <= 50  # Arbitrary limit
-        )
+        job_list, seen_ids = [], set()
+        start       = scraper_input.offset or 0
+        page_num    = (start // self.jobs_per_page) + 1
+        seconds_old = scraper_input.hours_old * 3600 if scraper_input.hours_old else None
+        go = lambda: len(job_list) < scraper_input.results_wanted and page_num <= 50
 
-        while continue_search():
-            request_count += 1
-            log.info(
-                f"Scraping page {request_count} / {math.ceil(scraper_input.results_wanted / self.jobs_per_page)} "
-                f"for search term: {scraper_input.search_term}"
-            )
-            params = {
-                "noOfResults": self.jobs_per_page,
-                "urlType": "search_by_keyword",
-                "searchType": "adv",
-                "keyword": scraper_input.search_term,
-                "pageNo": page,
-                "k": scraper_input.search_term,
-                "seoKey": f"{scraper_input.search_term.lower().replace(' ', '-')}-jobs",
-                "src": "jobsearchDesk",
-                "latLong": "",
-                "location": scraper_input.location,
-                "remote": "true" if scraper_input.is_remote else None,
-            }
-            if seconds_old:
-                params["days"] = seconds_old // 86400  # Convert to days
+        if scraper_input.linkedin_fetch_description:
+            self._start_playwright()
 
-            params = {k: v for k, v in params.items() if v is not None}
-            try:
-                log.debug(f"Sending request to {self.base_url} with params: {params}")
-                response = self.session.get(self.base_url, params=params, timeout=10)
-                if response.status_code not in range(200, 400):
-                    err = f"Naukri API response status code {response.status_code} - {response.text}"
-                    log.error(err)
-                    return JobResponse(jobs=job_list)
-                data = response.json()
-                job_details = data.get("jobDetails", [])
-                log.info(f"Received {len(job_details)} job entries from API")
-                if not job_details:
-                    log.warning("No job details found in API response")
-                    break
-            except Exception as e:
-                log.error(f"Naukri API request failed: {str(e)}")
-                return JobResponse(jobs=job_list)
-
-            for job in job_details:
-                job_id = job.get("jobId")
-                if not job_id or job_id in seen_ids:
-                    continue
-                seen_ids.add(job_id)
-                log.debug(f"Processing job ID: {job_id}")
+        try:
+            while go():
+                log.info(f"Page {page_num} | {len(job_list)}/{scraper_input.results_wanted}")
+                params = {
+                    "noOfResults": self.jobs_per_page, "urlType": "search_by_keyword",
+                    "searchType": "adv", "keyword": scraper_input.search_term,
+                    "pageNo": page_num, "k": scraper_input.search_term,
+                    "seoKey": f"{scraper_input.search_term.lower().replace(' ','-')}-jobs",
+                    "src": "jobsearchDesk", "latLong": "", "location": scraper_input.location or "",
+                }
+                if scraper_input.is_remote: params["remote"] = "true"
+                if seconds_old: params["days"] = seconds_old // 86400
 
                 try:
-                    fetch_desc = scraper_input.linkedin_fetch_description
-                    job_post = self._process_job(job, job_id, fetch_desc)
-                    if job_post:
-                        job_list.append(job_post)
-                        log.info(f"Added job: {job_post.title} (ID: {job_id})")
-                    if not continue_search():
+                    resp = self.session.get(self.base_url, params=params, timeout=15)
+                    if not resp.ok:
+                        log.error(f"Search API HTTP {resp.status_code}")
                         break
+                    data = resp.json()
+                    jobs = data.get("jobDetails", [])
+                    log.info(f"Search returned {len(jobs)} jobs")
+                    if not jobs: break
                 except Exception as e:
-                    log.error(f"Error processing job ID {job_id}: {str(e)}")
-                    raise NaukriException(str(e))
+                    log.error(f"Search API failed: {e}")
+                    break
 
-            if continue_search():
-                time.sleep(random.uniform(self.delay, self.delay + self.band_delay))
-                page += 1
+                for job in jobs:
+                    jid = job.get("jobId")
+                    if not jid or jid in seen_ids: continue
+                    seen_ids.add(jid)
+                    try:
+                        jp = self._process_job(job, jid, scraper_input.linkedin_fetch_description)
+                        if jp: job_list.append(jp)
+                        if not go(): break
+                    except Exception as e:
+                        log.error(f"Job {jid}: {e}")
 
-        job_list = job_list[:scraper_input.results_wanted]
-        log.info(f"Scraping completed. Total jobs collected: {len(job_list)}")
-        return JobResponse(jobs=job_list)
+                if go():
+                    time.sleep(random.uniform(self.delay, self.delay + self.band_delay))
+                    page_num += 1
+        finally:
+            self._stop_playwright()
 
-    def _process_job(
-        self, job: dict, job_id: str, full_descr: bool
-    ) -> Optional[JobPost]:
-        """
-        Processes a single job from API response into a JobPost object
-        """
-        title = job.get("title", "N/A")
-        company = job.get("companyName", "N/A")
-        company_url = f"https://www.naukri.com/{job.get('staticUrl', '')}" if job.get("staticUrl") else None
+        return JobResponse(jobs=job_list[:scraper_input.results_wanted])
 
-        location = self._get_location(job.get("placeholders", []))
-        compensation = self._get_compensation(job.get("placeholders", []))
-        date_posted = self._parse_date(job.get("footerPlaceholderLabel"), job.get("createdDate"))
+    # ══════════════════════════════════════════════════════════
+    # PROCESS JOB
+    # ══════════════════════════════════════════════════════════
 
-        job_url = f"https://www.naukri.com{job.get('jdURL', f'/job/{job_id}')}"
-        raw_description = job.get("jobDescription") if full_descr else None
+    def _process_job(self, job: dict, job_id: str, full_descr: bool) -> Optional[JobPost]:
+        title      = job.get("title", "N/A")
+        company    = job.get("companyName", "N/A")
+        job_url    = f"https://www.naukri.com{job.get('jdURL', f'/job/{job_id}')}"
+        location   = self._location_from_placeholders(job.get("placeholders", []))
+        comp       = self._salary_from_placeholders(job.get("placeholders", []))
+        posted     = self._parse_date(job.get("footerPlaceholderLabel"), job.get("createdDate"))
+        skills_str = job.get("tagsAndSkills", "")
+        skills     = [s.strip() for s in skills_str.split(",") if s.strip()] if skills_str else None
+        description = self._parse_html(job.get("jobDescription", ""))
 
-        job_type = parse_job_type(raw_description) if raw_description else None
-        company_industry = parse_company_industry(raw_description) if raw_description else None
+        if full_descr:
+            full = self._fetch_full_description(job_id, job_url)
+            if full and len(full) > len(description):
+                description = full
+                log.info(f"[✓] {job_id}: {len(description)} chars")
 
-        description = raw_description
         if description and self.scraper_input.description_format == DescriptionFormat.MARKDOWN:
             description = markdown_converter(description)
 
-        is_remote = is_job_remote(title, description or "", location)
-        company_logo = job.get("logoPathV3") or job.get("logoPath")
-
-        # Naukri-specific fields
-        skills = job.get("tagsAndSkills", "").split(",") if job.get("tagsAndSkills") else None
-        experience_range = job.get("experienceText")
-        ambition_box = job.get("ambitionBoxData", {})
-        company_rating = float(ambition_box.get("AggregateRating")) if ambition_box.get("AggregateRating") else None
-        company_reviews_count = ambition_box.get("ReviewsCount")
-        vacancy_count = job.get("vacancy")
-        work_from_home_type = self._infer_work_from_home_type(job.get("placeholders", []), title, description or "")
-
-        job_post = JobPost(
-            id=f"nk-{job_id}",
-            title=title,
-            company_name=company,
-            company_url=company_url,
-            location=location,
-            is_remote=is_remote,
-            date_posted=date_posted,
-            job_url=job_url,
-            compensation=compensation,
-            job_type=job_type,
-            company_industry=company_industry,
+        ab = job.get("ambitionBoxData", {}) or {}
+        return JobPost(
+            id=f"nk-{job_id}", title=title, company_name=company,
+            company_url=f"https://www.naukri.com/{job.get('staticUrl','')}" if job.get("staticUrl") else None,
+            location=location, is_remote=is_job_remote(title, description or "", location),
+            date_posted=posted, job_url=job_url, compensation=comp,
+            job_type=parse_job_type(description or ""),
+            company_industry=parse_company_industry(description or ""),
             description=description,
             emails=extract_emails_from_text(description or ""),
-            company_logo=company_logo,
-            skills=skills,
-            experience_range=experience_range,
-            company_rating=company_rating,
-            company_reviews_count=company_reviews_count,
-            vacancy_count=vacancy_count,
-            work_from_home_type=work_from_home_type,
+            company_logo=job.get("logoPathV3") or job.get("logoPath"),
+            skills=skills, experience_range=job.get("experienceText"),
+            company_rating=float(ab["AggregateRating"]) if ab.get("AggregateRating") else None,
+            company_reviews_count=ab.get("ReviewsCount"),
+            vacancy_count=job.get("vacancy"),
+            work_from_home_type=self._infer_wfh(job.get("placeholders",[]), title, description or ""),
         )
-        log.debug(f"Processed job: {title} at {company}")
-        return job_post
 
-    def _get_location(self, placeholders: list[dict]) -> Location:
-        """
-        Extracts location data from placeholders
-        """
-        location = Location(country=Country.INDIA)
-        for placeholder in placeholders:
-            if placeholder.get("type") == "location":
-                location_str = placeholder.get("label", "")
-                parts = location_str.split(", ")
-                city = parts[0] if parts else None
-                state = parts[1] if len(parts) > 1 else None
-                location = Location(city=city, state=state, country=Country.INDIA)
-                log.debug(f"Parsed location: {location.display_location()}")
-                break
-        return location
+    # ══════════════════════════════════════════════════════════
+    # FULL DESCRIPTION — reuse single visible tab, DOM extraction
+    # ══════════════════════════════════════════════════════════
 
-    def _get_compensation(self, placeholders: list[dict]) -> Optional[Compensation]:
-        """
-        Extracts compensation data from placeholders, handling Indian salary formats (Lakhs, Crores)
-        """
-        for placeholder in placeholders:
-            if placeholder.get("type") == "salary":
-                salary_text = placeholder.get("label", "").strip()
-                if salary_text == "Not disclosed":
-                    log.debug("Salary not disclosed")
-                    return None
+    def _fetch_full_description(self, job_id: str, job_url: str) -> Optional[str]:
+        # T1: pre-cached from cookie_fetcher
+        if job_id in self._desc_cache:
+            log.debug(f"[cache] {job_id}")
+            return self._parse_html(self._desc_cache[job_id])
 
-                # Handle Indian salary formats (e.g., "12-16 Lacs P.A.", "1-5 Cr")
-                salary_match = re.match(r"(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*(Lacs|Lakh|Cr)\s*(P\.A\.)?", salary_text, re.IGNORECASE)
-                if salary_match:
-                    min_salary, max_salary, unit = salary_match.groups()[:3]
-                    min_salary, max_salary = float(min_salary), float(max_salary)
-                    currency = "INR"
+        page = self._pw_page
+        if page is None:
+            return None
 
-                    # Convert to base units (INR)
-                    if unit.lower() in ("lacs", "lakh"):
-                        min_salary *= 100000  # 1 Lakh = 100,000 INR
-                        max_salary *= 100000
-                    elif unit.lower() == "cr":
-                        min_salary *= 10000000  # 1 Crore = 10,000,000 INR
-                        max_salary *= 10000000
+        try:
+            page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
 
-                    log.debug(f"Parsed salary: {min_salary} - {max_salary} INR")
-                    return Compensation(
-                        min_amount=int(min_salary),
-                        max_amount=int(max_salary),
-                        currency=currency,
+            # Wait for the JD container to render
+            try:
+                page.wait_for_selector(",".join(_DESC_SELECTORS), timeout=12000)
+            except Exception:
+                page.wait_for_timeout(4000)
+
+            # T2: extract description from rendered DOM
+            for sel in _DESC_SELECTORS:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        html = el.inner_html()
+                        if html and len(html) > 200:
+                            log.info(f"[dom ✓] {job_id} via {sel}")
+                            return self._parse_html(html)
+                except Exception:
+                    pass
+
+            # T3: in-browser fetch() — runs on naukri.com origin with cookies
+            try:
+                data = page.evaluate(
+                    """async (jobId) => {
+                        const url = `https://www.naukri.com/jobapi/v4/job/${jobId}`
+                                  + `?microsite=y&brandedConsultantJd=true`;
+                        try {
+                            const r = await fetch(url, {
+                                headers: { 'appid':'109', 'systemid':'109' },
+                                credentials: 'include'
+                            });
+                            if (!r.ok) return { error: r.status };
+                            return await r.json();
+                        } catch(e) { return { error: String(e) }; }
+                    }""",
+                    job_id,
+                )
+                if data and not data.get("error"):
+                    desc = (
+                        data.get("jobDetails", {}).get("description") or
+                        data.get("jobDetails", {}).get("jobDescription") or ""
                     )
+                    if desc:
+                        log.info(f"[fetch ✓] {job_id}: {len(desc)} chars")
+                        return self._parse_html(desc)
                 else:
-                    log.debug(f"Could not parse salary: {salary_text}")
-                    return None
+                    log.debug(f"[fetch] {job_id}: {data.get('error') if data else 'no data'}")
+            except Exception as e:
+                log.debug(f"[fetch] {job_id}: {e}")
+
+            log.warning(f"[detail] all methods failed for {job_id}")
+            return None
+
+        except Exception as e:
+            log.warning(f"[pw] {job_id}: {e}")
+            return None
+
+    # ══════════════════════════════════════════════════════════
+    # HTML → PLAIN TEXT
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _parse_html(html: str) -> str:
+        if not html or not html.strip(): return ""
+        if "<" not in html: return html.strip()
+        soup = BeautifulSoup(html, "html.parser")
+        for t in soup(["script","style","meta","link"]): t.decompose()
+        lines = []
+        def walk(el):
+            if not hasattr(el,"name"):
+                t=str(el).strip()
+                if t: lines.append(t)
+                return
+            n=el.name
+            if n in ("h1","h2","h3","h4","h5","h6"):
+                t=el.get_text(" ",strip=True)
+                if t: lines.append(f"\n{t}")
+            elif n in ("ul","ol"):
+                for li in el.find_all("li",recursive=False):
+                    t=li.get_text(" ",strip=True)
+                    if t: lines.append(f"• {t}")
+            elif n=="li":
+                t=el.get_text(" ",strip=True)
+                if t: lines.append(f"• {t}")
+            elif n in ("strong","b"):
+                t=el.get_text(" ",strip=True)
+                if t: lines.append(t)
+            elif n=="br": lines.append("")
+            elif n in ("p","div","section","article","span","td"):
+                if el.find(["ul","ol"]):
+                    for c in el.children: walk(c)
+                else:
+                    t=el.get_text(" ",strip=True)
+                    if t: lines.append(t)
+            else:
+                t=el.get_text(" ",strip=True)
+                if t: lines.append(t)
+        for c in (soup.find("body") or soup).children: walk(c)
+        if not lines: lines=[l for l in soup.get_text("\n",strip=True).split("\n") if l.strip()]
+        return re.sub(r'\n{3,}','\n\n',"\n".join(lines)).strip()
+
+    # ══════════════════════════════════════════════════════════
+    # HELPERS
+    # ══════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _location_from_placeholders(placeholders):
+        for p in placeholders:
+            if p.get("type") == "location":
+                city = p.get("label","").split("(")[0].strip()
+                return Location(city=city, country=Country.INDIA)
+        return Location(country=Country.INDIA)
+
+    @staticmethod
+    def _salary_from_placeholders(placeholders):
+        for p in placeholders:
+            if p.get("type") == "salary":
+                text = p.get("label","").strip()
+                if not text or text.lower() == "not disclosed": return None
+                m = re.match(
+                    r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(Lacs?|Lakh|Cr)\s*(?:P\.?A\.?)?",
+                    text, re.IGNORECASE
+                )
+                if m:
+                    lo,hi=float(m.group(1)),float(m.group(2))
+                    mult=100000 if m.group(3).lower() in ("lac","lacs","lakh") else 10000000
+                    return Compensation(min_amount=int(lo*mult),max_amount=int(hi*mult),currency="INR")
         return None
 
-    def _parse_date(self, label: str, created_date: int) -> Optional[date]:
-        """
-        Parses date from footerPlaceholderLabel or createdDate, returning a date object
-        """
+    @staticmethod
+    def _parse_date(label, created_date):
         today = datetime.now()
         if not label:
             if created_date:
-                return datetime.fromtimestamp(created_date / 1000).date()  # Convert to date
+                try:
+                    ts=int(created_date)
+                    if ts>1e10: ts//=1000
+                    return datetime.fromtimestamp(ts).date()
+                except Exception: pass
             return None
-        label = label.lower()
-        if "today" in label or "just now" in label or "few hours" in label:
-            log.debug("Date parsed as today")
-            return today.date()
-        elif "ago" in label:
-            match = re.search(r"(\d+)\s*day", label)
-            if match:
-                days = int(match.group(1))
-                parsed_date = (today - timedelta(days = days)).date()
-                log.debug(f"Date parsed: {days} days ago -> {parsed_date}")
-                return parsed_date
-        elif created_date:
-            parsed_date = datetime.fromtimestamp(created_date / 1000).date()
-            log.debug(f"Date parsed from timestamp: {parsed_date}")
-            return parsed_date
-        log.debug("No date parsed")
+        lb=label.lower()
+        if any(k in lb for k in ("today","just now","few hours","hour")): return today.date()
+        m=re.search(r"(\d+)\s*day",lb)
+        if m: return (today-timedelta(days=int(m.group(1)))).date()
+        m=re.search(r"(\d+)\s*month",lb)
+        if m: return (today-timedelta(days=int(m.group(1))*30)).date()
+        if "30+" in lb: return (today-timedelta(days=31)).date()
+        if created_date:
+            try:
+                ts=int(created_date)
+                if ts>1e10: ts//=1000
+                return datetime.fromtimestamp(ts).date()
+            except Exception: pass
         return None
 
-    def _infer_work_from_home_type(self, placeholders: list[dict], title: str, description: str) -> Optional[str]:
-        """
-        Infers work-from-home type from job data (e.g., 'Hybrid', 'Remote', 'Work from office')
-        """
-        location_str = next((p["label"] for p in placeholders if p["type"] == "location"), "").lower()
-        if "hybrid" in location_str or "hybrid" in title.lower() or "hybrid" in description.lower():
-            return "Hybrid"
-        elif "remote" in location_str or "remote" in title.lower() or "remote" in description.lower():
-            return "Remote"
-        elif "work from office" in description.lower() or not ("remote" in description.lower() or "hybrid" in description.lower()):
-            return "Work from office"
-        return None
+    @staticmethod
+    def _infer_wfh(placeholders, title, description):
+        loc=next((p["label"] for p in placeholders if p.get("type")=="location"),"").lower()
+        combo=f"{title} {description} {loc}".lower()
+        if "hybrid" in combo: return "Hybrid"
+        if "remote" in combo or "work from home" in combo or "wfh" in combo: return "Remote"
+        return "Work from office"
