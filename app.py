@@ -80,6 +80,9 @@ DEFAULT_CONFIG = {
         "drive_folder": "Job Applications",
         "sheet_tab": "Sheet1",
     },
+    "github": {
+        "token": "",
+    },
     "prompts": {
 
 # ══════════════════════════════════════════════════════════════
@@ -346,7 +349,7 @@ OUTPUT FORMAT:
 \\section{{Relevant Projects}}
 \\resumeSubHeadingListStart
   \\resumeProjectHeading
-    {{\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}}}{{Month Year}}
+    {{\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}}}{{}}
   \\resumeItemListStart
     \\resumeItem{{bullet 1}}
     \\resumeItem{{bullet 2}}
@@ -710,6 +713,112 @@ class PromptEditorDialog(ctk.CTkToplevel):
         default = DEFAULT_CONFIG["prompts"].get(self.prompt_key, "")
         self.editor.delete("1.0", "end")
         self.editor.insert("1.0", default)
+
+class ProjectLinkDialog(ctk.CTkToplevel):
+    def __init__(self, master, on_save):
+        super().__init__(master)
+        self.title("Add Project Link")
+        self.geometry("400x250")
+        self.grab_set()
+        self.on_save = on_save
+
+        self._build()
+
+    def _build(self):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(frame, text="Project Name", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(10, 0))
+        self.name_entry = ctk.CTkEntry(frame, placeholder_text="e.g. Trading Dashboard")
+        self.name_entry.pack(fill="x", pady=(4, 10))
+
+        ctk.CTkLabel(frame, text="Project Link", font=ctk.CTkFont(size=12)).pack(anchor="w")
+        self.link_entry = ctk.CTkEntry(frame, placeholder_text="https://github.com/...")
+        self.link_entry.pack(fill="x", pady=(4, 20))
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=10)
+
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, height=32,
+                      fg_color="#333", hover_color="#444",
+                      command=self.destroy).pack(side="right", padx=(5, 0))
+        ctk.CTkButton(btn_frame, text="Save", width=100, height=32,
+                      command=self._save).pack(side="right")
+
+    def _save(self):
+        name = self.name_entry.get().strip()
+        link = self.link_entry.get().strip()
+        if not name or not link:
+            messagebox.showwarning("Input Error", "Please enter both project name and link.")
+            return
+        self.on_save(name, link)
+        self.destroy()
+
+class GitHubImportDialog(ctk.CTkToplevel):
+    def __init__(self, master, on_save):
+        super().__init__(master)
+        self.title("Import from GitHub")
+        self.geometry("450x200")
+        self.grab_set()
+        self.on_save = on_save
+
+        self._build()
+
+    def _build(self):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(frame, text="GitHub Repository URL", font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(10, 0))
+        self.url_entry = ctk.CTkEntry(frame, placeholder_text="https://github.com/user/repo")
+        self.url_entry.pack(fill="x", pady=(4, 20))
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=10)
+
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, height=32,
+                      fg_color="#333", hover_color="#444",
+                      command=self.destroy).pack(side="right", padx=(5, 0))
+        ctk.CTkButton(btn_frame, text="Import", width=100, height=32,
+                      command=self._save).pack(side="right")
+
+    def _save(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Input Error", "Please enter a valid GitHub URL.")
+            return
+        self.on_save(url)
+        self.destroy()
+
+class GitHubImportProgressDialog(ctk.CTkToplevel):
+    def __init__(self, master, total_repos):
+        super().__init__(master)
+        self.title("Importing Projects")
+        self.geometry("400x150")
+        self.grab_set()
+        self.total_repos = total_repos
+        self.current_count = 0
+
+        self._build()
+
+    def _build(self):
+        frame = ctk.CTkFrame(self, fg_color="transparent")
+        frame.pack(fill="both", expand=True, padx=20, pady=20)
+
+        self.label = ctk.CTkLabel(frame, text=f"Initializing import...", font=ctk.CTkFont(size=13))
+        self.label.pack(pady=(10, 10))
+
+        self.progress_bar = ctk.CTkProgressBar(frame)
+        self.progress_bar.pack(fill="x", pady=10)
+        self.progress_bar.set(0)
+
+    def update_progress(self, current):
+        self.current_count = current
+        pct = current / self.total_repos if self.total_repos > 0 else 0
+        self.progress_bar.set(pct)
+        self.label.configure(text=f"Processing repositories: {current} / {self.total_repos}")
+
+    def close(self):
+        self.destroy()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1402,6 +1511,8 @@ class PipelineTab(ctk.CTkFrame):
             prompts = self.config.get("prompts", default={})
             roles   = self.config.get("experience_roles", default=None)
 
+            # 1. Experience Prompt (Inject Roles)
+            exp_prompt = prompts.get("experience_section", rb.PROMPT_EXPERIENCE)
             if roles:
                 roles_text = "\n".join([
                     f"Role {i+1}: {r['title']} @ {r['company']} | {r['dates']}\n"
@@ -1409,24 +1520,38 @@ class PipelineTab(ctk.CTkFrame):
                     f"{r['real_bullets']} real ({r['domain']} domain)"
                     for i, r in enumerate(roles)
                 ])
-                # Inject into experience prompt
-                exp_prompt = prompts.get("experience_section", rb.PROMPT_EXPERIENCE)
                 exp_prompt = _re.sub(
                     r'Role 1:.*?(?=\n━━━|\nBULLET RULES|\nRAW LaTeX)',
                     roles_text,
                     exp_prompt,
                     flags=_re.DOTALL
                 )
-                rb.PROMPT_EXPERIENCE = exp_prompt
+            rb.PROMPT_EXPERIENCE = exp_prompt
 
-            if "skills_section" in prompts:
-                rb.PROMPT_SKILLS = prompts["skills_section"]
-            if "experience_section" in prompts:
-                rb.PROMPT_EXPERIENCE = prompts["experience_section"]
-            if "projects_section" in prompts:
-                rb.PROMPT_PROJECTS = prompts["projects_section"]
-            if "cover_letter" in prompts:
-                rb.PROMPT_COVER_LETTER = prompts["cover_letter"]
+            # 2. Projects Prompt (Inject Links)
+            profile = self.config.get("profile", default={})
+            include_proj_links = profile.get("include_project_links", True)
+            proj_prompt = prompts.get("projects_section", rb.PROMPT_PROJECTS)
+
+            if include_proj_links:
+                # Replace standard heading with href version and force empty second arg
+                proj_prompt = proj_prompt.replace(
+                    "\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}",
+                    "\\href{url}{{\\textbf{Project Name}}} $|$ \\emph{{Tech1, Tech2, Tech3}}"
+                )
+                proj_prompt += "\n\nCRITICAL: For project headings, you MUST use the format: \\resumeProjectHeading{\\href{ACTUAL_URL}{{\\textbf{Project Name}}} $|$ \\emph{Techs}}{{}}. Replace 'ACTUAL_URL' with the real link found in the project data. The second set of braces must be EMPTY."
+            else:
+                # Remove href if present and force empty second arg
+                proj_prompt = proj_prompt.replace(
+                    "\\href{url}{{\\textbf{Project Name}}} $|$ \\emph{{Tech1, Tech2, Tech3}}",
+                    "\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}"
+                )
+                proj_prompt += "\n\nCRITICAL: For project headings, you MUST use the format: \\resumeProjectHeading{\\textbf{Project Name} $|$ \\emph{Techs}}{{}}. The second set of braces must be EMPTY."
+            rb.PROMPT_PROJECTS = proj_prompt
+
+            # 3. Other prompts (Simple override)
+            rb.PROMPT_SKILLS = prompts.get("skills_section", rb.PROMPT_SKILLS)
+            rb.PROMPT_COVER_LETTER = prompts.get("cover_letter", rb.PROMPT_COVER_LETTER)
 
         except Exception as e:
             self.log_queue.put(("log", "WARNING", f"Could not inject prompts: {e}"))
@@ -1624,6 +1749,21 @@ class SettingsTab(ctk.CTkFrame):
               fg_color="#333", hover_color="#444",
               command=self._test_google_auth).pack(side="left")
 
+        # ── GitHub Integration ──────────────────────────────────
+        self._section(scroll, "🐙 GitHub API")
+        gh_card = ctk.CTkFrame(scroll, corner_radius=10)
+        gh_card.pack(fill="x", pady=(0, 12))
+
+        gh_row = ctk.CTkFrame(gh_card, fg_color="transparent")
+        gh_row.pack(fill="x", padx=15, pady=15)
+        ctk.CTkLabel(gh_row, text="Personal Access Token", width=140, anchor="w").pack(side="left")
+        self.github_token_entry = ctk.CTkEntry(gh_row, placeholder_text="ghp_...", show="*")
+        self.github_token_entry.insert(0, self.config.get("github", "token", default=""))
+        self.github_token_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkButton(gh_card, text="Save GitHub Token", height=36,
+                      command=self._save_github).pack(padx=15, pady=(0, 15), fill="x")
+
         # ── Appearance ────────────────────────────────────────
         self._section(scroll, "🎨 Appearance")
         app_card = ctk.CTkFrame(scroll, corner_radius=10)
@@ -1660,6 +1800,12 @@ class SettingsTab(ctk.CTkFrame):
             self.config.set("google", key, entry.get().strip())
         self.config.save()
         messagebox.showinfo("Saved", "Google settings saved.")
+
+    def _save_github(self):
+        token = self.github_token_entry.get().strip()
+        self.config.set("github", "token", token)
+        self.config.save()
+        messagebox.showinfo("Saved", "GitHub token saved successfully.")
 
     def _test_google_auth(self):
         try:
@@ -2011,6 +2157,83 @@ class JobTrackerTab(ctk.CTkFrame):
             messagebox.showerror("Error", f"Could not remove Not Applied: {e}")
 
 # ══════════════════════════════════════════════════════════════
+#  TAB: Resume Order
+# ══════════════════════════════════════════════════════════════
+class ResumeOrderTab(ctk.CTkFrame):
+    def __init__(self, master, config, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.config = config
+
+        # Map for human-readable names
+        self.section_names = {
+            "education": "Education",
+            "skills": "Technical Skills",
+            "experience": "Experience",
+            "projects": "Relevant Projects"
+        }
+
+        # Load current order from config root
+        self.sections = self.config.get("section_order", default=["education", "skills", "experience", "projects"])
+
+        # Ensure the loaded order is valid (contains exactly the 4 required keys)
+        if not (isinstance(self.sections, list) and set(self.sections) == set(self.section_names.keys())):
+            self.sections = ["education", "skills", "experience", "projects"]
+
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Resume Section Order",
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 4), anchor="w", padx=30)
+        ctk.CTkLabel(self,
+                     text="Customize the order of sections in your LaTeX resume. Use the buttons to move sections up and down.",
+                     text_color="gray", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=30, pady=(0, 15))
+
+        self.list_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.list_frame.pack(fill="both", expand=True, padx=30)
+
+        self._refresh_list()
+
+        ctk.CTkButton(self, text="💾 Save Section Order", height=42,
+                      command=self._save_order).pack(padx=30, pady=20, fill="x")
+
+    def _refresh_list(self):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+
+        for i, section in enumerate(self.sections):
+            row = ctk.CTkFrame(self.list_frame, corner_radius=8)
+            row.pack(fill="x", pady=5)
+
+            name = self.section_names.get(section, section)
+            ctk.CTkLabel(row, text=f"{i+1}. {name}",
+                         font=ctk.CTkFont(size=13, weight="bold")).pack(side="left", padx=15, pady=10)
+
+            btn_frame = ctk.CTkFrame(row, fg_color="transparent")
+            btn_frame.pack(side="right", padx=10)
+
+            ctk.CTkButton(btn_frame, text="▲", width=30, height=30,
+                          fg_color="#333", hover_color="#444",
+                          command=lambda idx=i: self._move_up(idx)).pack(side="left", padx=2)
+            ctk.CTkButton(btn_frame, text="▼", width=30, height=30,
+                          fg_color="#333", hover_color="#444",
+                          command=lambda idx=i: self._move_down(idx)).pack(side="left", padx=2)
+
+    def _move_up(self, index):
+        if index > 0:
+            self.sections[index], self.sections[index-1] = self.sections[index-1], self.sections[index]
+            self._refresh_list()
+
+    def _move_down(self, index):
+        if index < len(self.sections) - 1:
+            self.sections[index], self.sections[index+1] = self.sections[index+1], self.sections[index]
+            self._refresh_list()
+
+    def _save_order(self):
+        self.config.set("section_order", self.sections)
+        self.config.save()
+        messagebox.showinfo("Saved", "Resume section order saved successfully!")
+
+# ══════════════════════════════════════════════════════════════
 #  TAB: Logs
 # ══════════════════════════════════════════════════════════════
 class LogsTab(ctk.CTkFrame):
@@ -2075,6 +2298,9 @@ class ResumeTab(ctk.CTkFrame):
         header.pack(fill="x", pady=(8, 4))
         ctk.CTkLabel(header, text="Paste your full resume text here",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkButton(header, text="🗑 Clear", width=80, height=28,
+                      fg_color="#442222", hover_color="#662222",
+                      command=self._clear_resume).pack(side="right", padx=4)
         ctk.CTkButton(header, text="Load File", width=90, height=28,
                       fg_color="#333", hover_color="#444",
                       command=self._load_resume).pack(side="right", padx=4)
@@ -2098,6 +2324,12 @@ class ResumeTab(ctk.CTkFrame):
         header.pack(fill="x", pady=(8, 4))
         ctk.CTkLabel(header, text="List your projects — one per section",
                      text_color="gray", font=ctk.CTkFont(size=11)).pack(side="left")
+        ctk.CTkButton(header, text="🌐 Import GitHub", width=110, height=28,
+                      fg_color="#333", hover_color="#444",
+                      command=self._import_github_project).pack(side="right", padx=4)
+        ctk.CTkButton(header, text="➕ Add Link", width=100, height=28,
+                      fg_color="#333", hover_color="#444",
+                      command=self._add_project_link).pack(side="right", padx=4)
         ctk.CTkButton(header, text="Load File", width=90, height=28,
                       fg_color="#333", hover_color="#444",
                       command=self._load_projects).pack(side="right", padx=4)
@@ -2316,6 +2548,113 @@ class ResumeTab(ctk.CTkFrame):
         with open(path, "w", encoding="utf-8") as f:
             f.write(self.projects_box.get("1.0", "end-1c"))
         messagebox.showinfo("Saved", f"Projects saved → {path}")
+
+    def _clear_resume(self):
+        if messagebox.askyesno("Confirm Clear", "Are you sure you want to permanently remove all resume text?"):
+            self.resume_box.delete("1.0", "end")
+            self._save_resume()
+            messagebox.showinfo("Cleared", "Resume text has been cleared and saved.")
+
+    def _add_project_link(self):
+        def handle_save(name, link):
+            text = f"{name} | {link}\n"
+            self.projects_box.insert("end", text)
+
+        ProjectLinkDialog(self, on_save=handle_save)
+
+    def _import_github_project(self):
+        from utils.github_importer import GitHubProjectImporter
+        from agents.api_client import RotatingOllamaClient
+
+        profile = self.config.get("profile", default={})
+        github_url = profile.get("github", "").strip()
+
+        if not github_url:
+            messagebox.showwarning("Missing Profile Info", "Please add your GitHub URL in the Profile tab first.")
+            return
+
+        def handle_import():
+            try:
+                model_name = self.config.get("model", "name", default="gemma4:31b-cloud")
+                api_keys = self.config.get("model", "api_keys", default=[])
+
+                if not api_keys:
+                    messagebox.showerror("Configuration Error", "No API keys found in settings.")
+                    return
+
+                import os
+                original_key = os.environ.get("OLLAMA_API_KEY", "")
+                if api_keys:
+                    os.environ["OLLAMA_API_KEY"] = api_keys[0]
+
+                client = RotatingOllamaClient(api_keys=api_keys, model=model_name)
+
+                # Get GitHub token from settings
+                github_token = self.config.get("github", "token", default="")
+                importer = GitHubProjectImporter(client, github_token=github_token)
+
+                # 1. Get total repo count for progress bar (briefly fetch list)
+                username = importer._extract_username(github_url)
+                if not username:
+                    raise ValueError("Could not extract GitHub username.")
+
+                import requests
+                repos_url = f"https://api.github.com/users/{username}/repos"
+                params = {"per_page": 100, "type": "owner"}
+
+                # Use token if available for initial count fetch
+                headers = {"Accept": "application/vnd.github.v3+json"}
+                if github_token:
+                    headers["Authorization"] = f"token {github_token}"
+
+                resp = requests.get(repos_url, params=params, headers=headers)
+                resp.raise_for_status()
+                repos_data = resp.json()
+                filtered_repos = [r for r in repos_data if not (r.get("forks_count", 0) > 0 and r.get("fork", False))]
+                total = len(filtered_repos)
+
+                if total == 0:
+                    messagebox.showwarning("No Projects", "No public repositories found for this account.")
+                    os.environ["OLLAMA_API_KEY"] = original_key
+                    return
+
+                # 2. Show progress dialog (in main thread)
+                progress_dialog = GitHubImportProgressDialog(self, total)
+
+                def worker():
+                    try:
+                        imported_entries = []
+                        count = 0
+
+                        # use the importer's generator
+                        for name, entry in importer.import_user_projects(github_url):
+                            count += 1
+                            if entry:
+                                imported_entries.append(entry)
+
+                            # Update UI progress
+                            self.after(0, lambda c=count: progress_dialog.update_progress(c))
+
+                        if not imported_entries:
+                            self.after(0, lambda: messagebox.showwarning("Import Finished", "No projects were successfully processed."))
+                        else:
+                            content = "\n\n".join(imported_entries)
+                            self.after(0, lambda: self.projects_box.insert("end", f"\n\n{content}\n"))
+                            self.after(0, lambda: messagebox.showinfo("Success", f"Imported {len(imported_entries)} projects from GitHub!"))
+
+                    except Exception as e:
+                        self.after(0, lambda: messagebox.showerror("Import Error", f"Error during import: {e}"))
+                    finally:
+                        os.environ["OLLAMA_API_KEY"] = original_key
+                        self.after(0, progress_dialog.close)
+
+                import threading
+                threading.Thread(target=worker, daemon=True).start()
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Initialization failed: {e}")
+
+        handle_import()
 # ══════════════════════════════════════════════════════════════
 #  MAIN WINDOW
 # ══════════════════════════════════════════════════════════════
@@ -2374,6 +2713,7 @@ class JobHunterApp(ctk.CTk):
             ("Job Tracker", "📊"),
             ("Profile",    "👤"),   # ← ADD
             ("Resume",     "📄"),
+            ("Resume Order", "↕"),
             ("Prompts",    "✏"),
             ("Settings",   "⚙"),
             ("Logs",       "📋"),
@@ -2406,6 +2746,7 @@ class JobHunterApp(ctk.CTk):
             "Job Tracker": JobTrackerTab(self.content, self.config),
             "Profile":   ProfileTab(self.content, self.config),   # ← ADD
             "Resume":    ResumeTab(self.content, self.config),
+            "Resume Order": ResumeOrderTab(self.content, self.config),
             "Prompts":   PromptsTab(self.content, self.config),
             "Settings":  SettingsTab(self.content, self.config),
             "Logs":      LogsTab(self.content),

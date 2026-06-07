@@ -63,7 +63,7 @@ def load_profile(config_file="app_config.json") -> dict:
     return defaults
 
 
-def build_fixed_header(profile: dict, location_override: str = None) -> str:
+def build_fixed_header(profile: dict, location_override: str = None, include_links: bool = True) -> str:
     """Generate the LaTeX header block from profile data."""
     name     = profile.get("full_name",  "Your Name")
     phone    = profile.get("phone",      "+1 000-000-0000")
@@ -83,18 +83,20 @@ def build_fixed_header(profile: dict, location_override: str = None) -> str:
         contact_parts.append(
             f"\\href{{mailto:{email}}}{{\\raisebox{{-0.2\\height}}\\faEnvelope\\ \\underline{{{email}}}}}"
         )
-    if linkedin:
-        handle = linkedin.split("/in/")[-1].strip("/") if "/in/" in linkedin else linkedin
-        contact_parts.append(
-            f"\\href{{https://{linkedin if linkedin.startswith('linkedin') else 'linkedin.com/in/'+handle}}}"
-            f"{{\\raisebox{{-0.2\\height}}\\faLinkedin\\ \\underline{{{handle}}}}}"
-        )
-    if github:
-        gh_handle = github.split("github.com/")[-1].strip("/") if "github.com" in github else github
-        contact_parts.append(
-            f"\\href{{https://github.com/{gh_handle}}}"
-            f"{{\\raisebox{{-0.2\\height}}\\faGithub\\ \\underline{{{gh_handle}}}}}"
-        )
+
+    if include_links:
+        if linkedin:
+            handle = linkedin.split("/in/")[-1].strip("/") if "/in/" in linkedin else linkedin
+            contact_parts.append(
+                f"\\href{{https://{linkedin if linkedin.startswith('linkedin') else 'linkedin.com/in/'+handle}}}"
+                f"{{\\raisebox{{-0.2\\height}}\\faLinkedin\\ \\underline{{{handle}}}}}"
+            )
+        if github:
+            gh_handle = github.split("github.com/")[-1].strip("/") if "github.com" in github else github
+            contact_parts.append(
+                f"\\href{{https://github.com/{gh_handle}}}"
+                f"{{\\raisebox{{-0.2\\height}}\\faGithub\\ \\underline{{{gh_handle}}}}}"
+            )
 
     contact_line = " ~\n    ".join(contact_parts)
 
@@ -797,6 +799,17 @@ class ProfileTab(ctk.CTkFrame):
             e.pack(side="left", fill="x", expand=True)
             self._personal_fields[key] = e
 
+        # Link Toggles
+        links_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        links_row.pack(fill="x", pady=10)
+        ctk.CTkLabel(links_row, text="Include Header Links", width=130, anchor="w").pack(side="left")
+        self.include_links_var = ctk.BooleanVar(value=profile.get("include_links", True))
+        ctk.CTkSwitch(links_row, text="", variable=self.include_links_var).pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(links_row, text="Include Project Links", width=130, anchor="w").pack(side="left")
+        self.include_proj_links_var = ctk.BooleanVar(value=profile.get("include_project_links", True))
+        ctk.CTkSwitch(links_row, text="", variable=self.include_proj_links_var).pack(side="left")
+
         ctk.CTkLabel(scroll, text="Career Profile",
                      font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(12, 4))
 
@@ -835,6 +848,8 @@ class ProfileTab(ctk.CTkFrame):
                 profile[key] = widget.get("1.0", "end-1c").strip()
             else:
                 profile[key] = widget.get().strip()
+        profile["include_links"] = self.include_links_var.get()
+        profile["include_project_links"] = self.include_proj_links_var.get()
         self.config.set("profile", profile)
 
         # Update filenames

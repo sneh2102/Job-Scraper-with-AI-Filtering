@@ -23,4 +23,6 @@ JobHunter_Windows.zip
 Thumbs.db
 .idea/
 .vscode/
+.claude/
+outputs/
 

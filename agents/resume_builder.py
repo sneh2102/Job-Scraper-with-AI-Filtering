@@ -148,7 +148,7 @@ Generate ONLY the RELEVANT PROJECTS section body.
 OUTPUT FORMAT CONTRACT (never deviate):
 \\section{Relevant Projects}
 \\resumeSubHeadingListStart
-  \\resumeProjectHeading{\\textbf{Project Name} $|$ \\emph{Tech1, Tech2, Tech3}}{Month Year}
+  \\resumeProjectHeading{\\textbf{Project Name} $|$ \\emph{Tech1, Tech2, Tech3}}{{}}
   \\resumeItemListStart
     \\resumeItem{bullet 1}
     \\resumeItem{bullet 2}
@@ -289,7 +289,7 @@ ATS FEEDBACK (MUST address every point):
 INSTRUCTIONS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. Identify top 5 technical requirements from JD.
-2. Select 3-4 projects that best demonstrate those requirements.
+2. Select 3-4 projects from the list that best demonstrate those requirements.
 3. If a critical JD skill has NO matching project, FABRICATE a realistic project.
 4. For each project, write 2-3 bullets:
    Bullet 1: Problem + technology + scale
@@ -300,7 +300,13 @@ BULLET RULES:
 - Every bullet = 2 full lines minimum
 - Every bullet has a specific number/metric
 - Use \\textbf{{}} on project name and 1-2 key technologies
-- All % → \\%, all & → \\&"""
+- All % → \\%, all & → \\&
+
+PROJECT LINKING RULE:
+- Each project entry in the AVAILABLE PROJECTS list contains a URL.
+- If the prompt template asks for \\href{{url}}, replace 'url' with the ACTUAL URL from the project data.
+- DO NOT write the word "url" or "link" in the LaTeX; use the real GitHub link.
+"""
 
 _DEFAULT_PROMPT_COVER_LETTER = """You are writing a cover letter for {candidate_name}.
 Output ONLY the plain text cover letter.
@@ -477,13 +483,14 @@ class ResumeBuilderAgent:
 
         # Build Header and Education from profile
         profile = load_profile()
+        include_links = profile.get("include_links", True)
         if use_jd_location:
             location_override = self._extract_location(description, location)
             if not location_override:
                 location_override = default_location
         else:
             location_override = default_location
-        header = build_fixed_header(profile, location_override=location_override)
+        header = build_fixed_header(profile, location_override=location_override, include_links=include_links)
 
         edu_list = profile.get("education", [])
         if edu_list:
