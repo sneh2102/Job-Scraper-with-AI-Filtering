@@ -73,7 +73,22 @@ DEFAULT_CONFIG = {
         "cover_letter_filename": "Cover_Letter",
         "use_jd_location": True,
         "default_location": "Canada",
+        "section_order": ["education", "summary", "skills", "experience", "projects", "achievements"],
     },
+    "custom_sections": [
+        {
+            "id": "summary",
+            "name": "Summary",
+            "system_prompt": "You are an expert resume writer. Output ONLY raw LaTeX — no backticks, no explanation. Generate ONLY the Professional Summary section body.\\n\\nOUTPUT FORMAT CONTRACT:\\n\\\\section{{Professional Summary}}\\n{{A 3-4 line concise paragraph summarizing the candidate's value proposition, tailored to the JD. No bullet points. Use LaTeX and ensure all % -> \\\\%, all & -> \\\\&.}}\\n\\nABSOLUTE RULES:\\n- NO \\\\documentclass, NO \\\\usepackage, NO \\\\begin{{document}}, NO \\\\end{{document}}",
+            "user_prompt": "Write a professional summary for {full_name} for the role of {title} at {company}.\\n\\nJOB DESCRIPTION:\\n{description}\\n\\nCANDIDATE RESUME:\\n{existing_resume}\\n\\nATS FEEDBACK:\\n{ats_feedback}"
+        },
+        {
+            "id": "achievements",
+            "name": "Achievements",
+            "system_prompt": "You are an expert resume writer. Output ONLY raw LaTeX — no backticks, no explanation. Generate ONLY the Achievements section body.\\n\\nOUTPUT FORMAT CONTRACT:\\n\\\\section{{Achievements}}\\n\\\\resumeSubHeadingListStart\\n  \\\\resumeItem{{Achievement 1 with metric}}\\n  \\\\resumeItem{{Achievement 2 with metric}}\\n\\\\resumeSubHeadingListEnd\\n\\nABSOLUTE RULES:\\n- NO \\\\documentclass, NO \\\\usepackage, NO \\\\begin{{document}}, NO \\\\end{{document}}",
+            "user_prompt": "List 2-3 key professional achievements for {full_name} that would impress the hiring manager for {title} at {company}.\\n\\nJOB DESCRIPTION:\\n{description}\\n\\nCANDIDATE RESUME:\\n{existing_resume}\\n\\nATS FEEDBACK:\\n{ats_feedback}"
+        }
+    ],
     "google": {
         "enabled": False,
         "spreadsheet_id": "",
@@ -1660,9 +1675,156 @@ class PromptsTab(ctk.CTkFrame):
             self._build()
 
 
-# ══════════════════════════════════════════════════════════════
-#  TAB: Settings
-# ══════════════════════════════════════════════════════════════
+class CustomSectionDialog(ctk.CTkToplevel):
+    def __init__(self, master, on_save, existing_section=None):
+        super().__init__(master)
+        self.title("Add/Edit Custom Section")
+        self.geometry("800x600")
+        self.grab_set()
+        self.on_save = on_save
+        self.existing_section = existing_section
+        self._build()
+
+    def _build(self):
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(scroll, text="Section Basic Info", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 10))
+
+        row1 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row1.pack(fill="x", pady=5)
+        ctk.CTkLabel(row1, text="Internal ID (e.g. 'summary')", width=150, anchor="w").pack(side="left")
+        self.id_entry = ctk.CTkEntry(row1)
+        self.id_entry.pack(side="left", fill="x", expand=True)
+        if self.existing_section:
+            self.id_entry.insert(0, self.existing_section.get("id", ""))
+            self.id_entry.configure(state="disabled") # ID shouldn't be changed
+
+        row2 = ctk.CTkFrame(scroll, fg_color="transparent")
+        row2.pack(fill="x", pady=5)
+        ctk.CTkLabel(row2, text="Display Name (e.g. 'Professional Summary')", width=150, anchor="w").pack(side="left")
+        self.name_entry = ctk.CTkEntry(row2)
+        self.name_entry.pack(side="left", fill="x", expand=True)
+        if self.existing_section:
+            self.name_entry.insert(0, self.existing_section.get("name", ""))
+
+        ctk.CTkLabel(scroll, text="System Prompt", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(15, 5))
+        self.sys_prompt_box = ctk.CTkTextbox(scroll, height=150, font=ctk.CTkFont(family="Consolas", size=12))
+        self.sys_prompt_box.pack(fill="x", pady=(0, 15))
+        if self.existing_section:
+            self.sys_prompt_box.insert("1.0", self.existing_section.get("system_prompt", ""))
+
+        ctk.CTkLabel(scroll, text="User Prompt", font=ctk.CTkFont(weight="bold")).pack(anchor="w", pady=(0, 5))
+        self.user_prompt_box = ctk.CTkTextbox(scroll, height=150, font=ctk.CTkFont(family="Consolas", size=12))
+        self.user_prompt_box.pack(fill="x", pady=(0, 15))
+        if self.existing_section:
+            self.user_prompt_box.insert("1.0", self.existing_section.get("user_prompt", ""))
+
+        btn_frame = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_frame.pack(fill="x", pady=20)
+        ctk.CTkButton(btn_frame, text="Cancel", width=100, fg_color="#333", command=self.destroy).pack(side="right", padx=5)
+        ctk.CTkButton(btn_frame, text="Save Section", width=150, command=self._save).pack(side="right")
+
+    def _save(self):
+        sec_id = self.id_entry.get().strip().lower().replace(" ", "_")
+        name = self.name_entry.get().strip()
+        sys_p = self.sys_prompt_box.get("1.0", "end-1c").strip()
+        user_p = self.user_prompt_box.get("1.0", "end-1c").strip()
+
+        if not sec_id or not name:
+            messagebox.showwarning("Input Error", "ID and Name are required.")
+            return
+
+        self.on_save({
+            "id": sec_id,
+            "name": name,
+            "system_prompt": sys_p,
+            "user_prompt": user_p
+        })
+        self.destroy()
+
+class CustomSectionsTab(ctk.CTkFrame):
+    def __init__(self, master, config, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.config = config
+        self._build()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Custom Resume Sections",
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 4), anchor="w", padx=30)
+        ctk.CTkLabel(self,
+                     text="Add additional AI-generated sections to your resume (e.g. Summary, Achievements, Certifications).",
+                     text_color="gray", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=30, pady=(0, 15))
+
+        top_bar = ctk.CTkFrame(self, fg_color="transparent")
+        top_bar.pack(fill="x", padx=30, pady=(0, 10))
+        ctk.CTkButton(top_bar, text="➕ Add New Section", height=32,
+                      command=self._add_section).pack(side="left")
+
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll.pack(fill="both", expand=True, padx=30, pady=(0, 20))
+        self._refresh_list()
+
+    def _refresh_list(self):
+        for w in self.scroll.winfo_children():
+            w.destroy()
+
+        sections = self.config.get("custom_sections", default=[])
+        if not sections:
+            ctk.CTkLabel(self.scroll, text="No custom sections added yet.", text_color="gray").pack(pady=20)
+            return
+
+        for idx, sec in enumerate(sections):
+            card = ctk.CTkFrame(self.scroll, corner_radius=10)
+            card.pack(fill="x", pady=6)
+
+            row = ctk.CTkFrame(card, fg_color="transparent")
+            row.pack(fill="x", padx=15, pady=12)
+
+            ctk.CTkLabel(row, text=f"{sec.get('name', 'Unnamed')} ({sec.get('id', 'n/a')})",
+                         font=ctk.CTkFont(weight="bold")).pack(side="left")
+
+            btn_frame = ctk.CTkFrame(row, fg_color="transparent")
+            btn_frame.pack(side="right")
+
+            ctk.CTkButton(btn_frame, text="Edit", width=60, height=28, fg_color="#333",
+                          command=lambda s=sec: self._edit_section(s)).pack(side="left", padx=4)
+            ctk.CTkButton(btn_frame, text="Delete", width=60, height=28, fg_color="#442222",
+                          command=lambda i=idx: self._delete_section(i)).pack(side="left", padx=4)
+
+    def _add_section(self):
+        CustomSectionDialog(self, self._save_section)
+
+    def _edit_section(self, section):
+        CustomSectionDialog(self, self._save_section, existing_section=section)
+
+    def _save_section(self, sec_data):
+        sections = self.config.get("custom_sections", default=[])
+        # Update if exists, else append
+        updated = False
+        for i, s in enumerate(sections):
+            if s.get("id") == sec_data["id"]:
+                sections[i] = sec_data
+                updated = True
+                break
+        if not updated:
+            sections.append(sec_data)
+
+        self.config.set("custom_sections", sections)
+        self.config.save()
+        self._refresh_list()
+        messagebox.showinfo("Saved", "Custom section updated successfully.")
+
+    def _delete_section(self, index):
+        if messagebox.askyesno("Delete", "Are you sure you want to remove this section?"):
+            sections = self.config.get("custom_sections", default=[])
+            if 0 <= index < len(sections):
+                sections.pop(index)
+                self.config.set("custom_sections", sections)
+                self.config.save()
+                self._refresh_list()
+
+
 class SettingsTab(ctk.CTkFrame):
     def __init__(self, master, config, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
@@ -2164,22 +2326,53 @@ class ResumeOrderTab(ctk.CTkFrame):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.config = config
 
-        # Map for human-readable names
-        self.section_names = {
-            "education": "Education",
-            "skills": "Technical Skills",
+        self.base_section_names = {
+            "education":  "Education",
+            "skills":     "Technical Skills",
             "experience": "Experience",
-            "projects": "Relevant Projects"
+            "projects":   "Relevant Projects",
         }
 
-        # Load current order from config root
-        self.sections = self.config.get("section_order", default=["education", "skills", "experience", "projects"])
+        # Build combined names map including custom sections
+        custom_sections = self.config.get("custom_sections", default=[])
+        self.section_names = dict(self.base_section_names)
+        for cs in custom_sections:
+            cs_id = cs.get("id")
+            if cs_id:
+                self.section_names[cs_id] = cs.get("name", cs_id)
 
-        # Ensure the loaded order is valid (contains exactly the 4 required keys)
-        if not (isinstance(self.sections, list) and set(self.sections) == set(self.section_names.keys())):
-            self.sections = ["education", "skills", "experience", "projects"]
+        base_keys   = list(self.base_section_names.keys())
+        custom_keys = [cs.get("id") for cs in custom_sections if cs.get("id")]
+        default_order = base_keys + custom_keys
+
+        saved = self.config.get("section_order", default=None)
+        if saved and isinstance(saved, list):
+            valid = [s for s in saved if s in self.section_names]
+            for key in default_order:
+                if key not in valid:
+                    valid.append(key)
+            self.sections = valid
+        else:
+            self.sections = default_order
 
         self._build()
+
+    def _reload_sections(self):
+        """Re-read custom sections from config and sync the order list."""
+        custom_sections = self.config.get("custom_sections", default=[])
+        self.section_names = dict(self.base_section_names)
+        for cs in custom_sections:
+            cs_id = cs.get("id")
+            if cs_id:
+                self.section_names[cs_id] = cs.get("name", cs_id)
+
+        all_known = set(self.section_names.keys())
+        valid = [s for s in self.sections if s in all_known]
+        for key in list(self.base_section_names.keys()) + [cs.get("id") for cs in custom_sections if cs.get("id")]:
+            if key not in valid:
+                valid.append(key)
+        self.sections = valid
+        self._refresh_list()
 
     def _build(self):
         ctk.CTkLabel(self, text="Resume Section Order",
@@ -2187,6 +2380,12 @@ class ResumeOrderTab(ctk.CTkFrame):
         ctk.CTkLabel(self,
                      text="Customize the order of sections in your LaTeX resume. Use the buttons to move sections up and down.",
                      text_color="gray", font=ctk.CTkFont(size=12)).pack(anchor="w", padx=30, pady=(0, 15))
+
+        top_bar = ctk.CTkFrame(self, fg_color="transparent")
+        top_bar.pack(fill="x", padx=30, pady=(0, 5))
+        ctk.CTkButton(top_bar, text="🔄 Refresh Sections", width=150, height=28,
+                      fg_color="#333", hover_color="#444",
+                      command=self._reload_sections).pack(side="left")
 
         self.list_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.list_frame.pack(fill="both", expand=True, padx=30)
@@ -2691,7 +2890,7 @@ class JobHunterApp(ctk.CTk):
         # ── Sidebar ───────────────────────────────────────────
         sidebar = ctk.CTkFrame(self, width=220, corner_radius=0, fg_color="#161b22")
         sidebar.grid(row=0, column=0, sticky="nsew")
-        sidebar.grid_rowconfigure(10, weight=1)
+        sidebar.grid_rowconfigure(15, weight=1)
 
         # Logo
         logo = ctk.CTkFrame(sidebar, fg_color="transparent")
@@ -2707,16 +2906,17 @@ class JobHunterApp(ctk.CTk):
             row=1, column=0, sticky="ew", padx=12, pady=4)
 
         nav_items = [
-            ("Dashboard",  "🏠"),
-            ("Scraper",    "🔍"),
-            ("Pipeline",   "⚙"),
-            ("Job Tracker", "📊"),
-            ("Profile",    "👤"),   # ← ADD
-            ("Resume",     "📄"),
-            ("Resume Order", "↕"),
-            ("Prompts",    "✏"),
-            ("Settings",   "⚙"),
-            ("Logs",       "📋"),
+            ("Dashboard",       "🏠"),
+            ("Scraper",         "🔍"),
+            ("Pipeline",        "⚙"),
+            ("Job Tracker",     "📊"),
+            ("Profile",         "👤"),
+            ("Resume",          "📄"),
+            ("Resume Order",    "↕"),
+            ("Custom Sections", "✨"),
+            ("Prompts",         "✏"),
+            ("Settings",        "⚙"),
+            ("Logs",            "📋"),
         ]
 
         self.nav_buttons = {}
@@ -2730,7 +2930,7 @@ class JobHunterApp(ctk.CTk):
         # Version info at bottom
         ctk.CTkLabel(sidebar, text="JobHunter AI",
                      font=ctk.CTkFont(size=10), text_color="#444").grid(
-            row=11, column=0, padx=16, pady=(0, 8), sticky="sw")
+            row=16, column=0, padx=16, pady=(0, 8), sticky="sw")
 
         # ── Content area ──────────────────────────────────────
         self.content = ctk.CTkFrame(self, corner_radius=0, fg_color="#0d1117")
@@ -2740,16 +2940,17 @@ class JobHunterApp(ctk.CTk):
 
         # Build all tabs
         self.tabs = {
-            "Dashboard": DashboardTab(self.content, self.config),
-            "Scraper":   ScraperTab(self.content, self.config, self.log_queue),
-            "Pipeline":  PipelineTab(self.content, self.config, self.log_queue),
-            "Job Tracker": JobTrackerTab(self.content, self.config),
-            "Profile":   ProfileTab(self.content, self.config),   # ← ADD
-            "Resume":    ResumeTab(self.content, self.config),
-            "Resume Order": ResumeOrderTab(self.content, self.config),
-            "Prompts":   PromptsTab(self.content, self.config),
-            "Settings":  SettingsTab(self.content, self.config),
-            "Logs":      LogsTab(self.content),
+            "Dashboard":       DashboardTab(self.content, self.config),
+            "Scraper":         ScraperTab(self.content, self.config, self.log_queue),
+            "Pipeline":        PipelineTab(self.content, self.config, self.log_queue),
+            "Job Tracker":     JobTrackerTab(self.content, self.config),
+            "Profile":         ProfileTab(self.content, self.config),
+            "Resume":          ResumeTab(self.content, self.config),
+            "Resume Order":    ResumeOrderTab(self.content, self.config),
+            "Custom Sections": CustomSectionsTab(self.content, self.config),
+            "Prompts":         PromptsTab(self.content, self.config),
+            "Settings":        SettingsTab(self.content, self.config),
+            "Logs":            LogsTab(self.content),
         }
     
         for tab in self.tabs.values():

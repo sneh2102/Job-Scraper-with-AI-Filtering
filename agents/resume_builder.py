@@ -467,7 +467,7 @@ class ResumeBuilderAgent:
         self.projects_text   = projects_text
         self.existing_resume = existing_resume
 
-    # ── Main build — 4 separate API calls ────────────────────
+    # ── Main build — Dynamic sections ──────────────────────────
     def build(self, title: str, company: str, description: str, ats_feedback="", location="", use_jd_location=True, default_location="Canada") -> tuple[str, str]:
         fb        = self._parse_ats_feedback(ats_feedback)
         safe_desc = self._safe(description)
@@ -482,7 +482,6 @@ class ResumeBuilderAgent:
         p_cover       = prompts.get("cover_letter")       or PROMPT_COVER_LETTER
 
         # Build Header and Education from profile
-        profile = load_profile()
         include_links = profile.get("include_links", True)
         if use_jd_location:
             location_override = self._extract_location(description, location)
@@ -507,8 +506,11 @@ class ResumeBuilderAgent:
         else:
             education = FIXED_EDUCATION
 
+        # ── Standard Sections ─────────────────────────────────────
+        section_map = {"education": education}
+
         logger.info("Building skills section...")
-        skills = self._clean(self.client.complete(
+        section_map["skills"] = self._clean(self.client.complete(
             system=_SYSTEM_SKILLS,
             user=p_skills.format(
                 title=title, company=company,
@@ -519,7 +521,7 @@ class ResumeBuilderAgent:
         ))
 
         logger.info("Building experience section...")
-        experience = self._clean(self.client.complete(
+        section_map["experience"] = self._clean(self.client.complete(
             system=_SYSTEM_EXPERIENCE,
             user=p_experience.format(
                 title=title, company=company,
@@ -531,7 +533,7 @@ class ResumeBuilderAgent:
         ))
 
         logger.info("Building projects section...")
-        projects = self._clean(self.client.complete(
+        section_map["projects"] = self._clean(self.client.complete(
             system=_SYSTEM_PROJECTS,
             user=p_projects.format(
                 title=title, company=company,
@@ -541,6 +543,37 @@ class ResumeBuilderAgent:
                 ats_feedback=fb.get("projects", "None — first attempt."),
             ),
         ))
+
+        # ── Custom Sections ──────────────────────────────────────
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app_config.json")
+        custom_sections = []
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, encoding="utf-8") as f:
+                    custom_sections = json.load(f).get("custom_sections", [])
+        except Exception as e:
+            logger.warning("Could not load custom sections: %s", e)
+
+        for cs in custom_sections:
+            cs_id = cs.get("id")
+            if not cs_id: continue
+            logger.info("Building custom section: %s", cs_id)
+
+            # Use a generic feedback key if specific one doesn't exist
+            cs_feedback = fb.get(cs_id, fb.get("skills", "None — first attempt."))
+
+            section_content = self._clean(self.client.complete(
+                system=cs.get("system_prompt", "You are an expert resume writer."),
+                user=cs.get("user_prompt", "").format(
+                    full_name=profile.get("full_name", "Your Name"),
+                    title=title,
+                    company=company,
+                    description=safe_desc,
+                    existing_resume=self.existing_resume,
+                    ats_feedback=cs_feedback
+                ),
+            ))
+            section_map[cs_id] = section_content
 
         logger.info("Building cover letter...")
         cover_letter = self.client.complete(
@@ -559,7 +592,7 @@ class ResumeBuilderAgent:
             ),
         ).strip()
 
-        latex = self._assemble(header, education, skills, experience, projects)
+        latex = self._assemble(header, education, section_map)
         logger.info("Resume assembled: %d chars | Cover: %d chars", len(latex), len(cover_letter))
         return latex, cover_letter
 
@@ -630,18 +663,42 @@ RULES:
 - Output ONLY the \\section{{Relevant Projects}} block"""
 
         else:
-            raise ValueError(f"Unknown section: {section}")
+            cs_data = self._load_custom_section_data(section)
+            if not cs_data:
+                raise ValueError(f"Unknown section: {section}")
+            profile = _load_profile()
+            system = cs_data.get("system_prompt", _SYSTEM_SURGICAL)
+            user_template = cs_data.get("user_prompt", "")
+            try:
+                user = user_template.format(
+                    full_name=profile.get("full_name", "Your Name"),
+                    title=title,
+                    company=company,
+                    description=safe_desc,
+                    existing_resume=self.existing_resume,
+                    ats_feedback=feedback,
+                )
+            except (KeyError, IndexError):
+                user = (
+                    f"Rewrite the {cs_data.get('name', section)} section.\n\n"
+                    f"CURRENT:\n{current_latex}\n\n"
+                    f"JOB TITLE: {title}\n"
+                    f"ATS FEEDBACK:\n{feedback}"
+                )
+            result = self.client.complete(system=system, user=user)
+            return self._clean(result)
 
         result = self.client.complete(system=_SYSTEM_SURGICAL, user=user)
         return self._clean(result)
 
     # ── Assembly ──────────────────────────────────────────────
     @staticmethod
-    def _assemble(header, education, skills, experience, projects) -> str:
+    def _assemble(header, education, section_map) -> str:
         import json as _json
         import os as _os
-    
+
         # Load section order from app_config.json
+        # Check root-level first (set by ResumeOrderTab), then pipeline fallback
         order = ["education", "skills", "experience", "projects"]
         try:
             config_path = _os.path.join(
@@ -651,22 +708,28 @@ RULES:
             if _os.path.exists(config_path):
                 with open(config_path, encoding="utf-8") as f:
                     cfg = _json.load(f)
-                saved = cfg.get("section_order", [])
-                if saved and set(saved) == {"education", "skills", "experience", "projects"}:
-                    order = saved
+                saved = (
+                    cfg.get("section_order")
+                    or cfg.get("pipeline", {}).get("section_order", [])
+                )
+                if saved:
+                    order = list(saved)
         except Exception:
             pass
-    
-        section_map = {
-            "education":  education,
-            "skills":     skills,
-            "experience": experience,
-            "projects":   projects,
-        }
-    
+
+        # Always append any custom section keys from section_map that aren't
+        # already in order — ensures newly added custom sections are included
+        # even if the user hasn't re-saved from the Resume Order tab.
+        base_keys = {"education", "skills", "experience", "projects"}
+        for key in section_map:
+            if key not in base_keys and key not in order and section_map[key].strip():
+                order.append(key)
+
         result = LATEX_PREAMBLE + "\n\n" + header
         for key in order:
-            result += "\n\n" + section_map.get(key, "")
+            content = section_map.get(key, "")
+            if content.strip():
+                result += "\n\n" + content
         result += "\n\n\\end{document}"
         return result
     
@@ -740,9 +803,31 @@ RULES:
         if not feedback:
             return {"skills": "", "experience": "", "projects": ""}
         if isinstance(feedback, dict):
-            return {
+            result = {
                 "skills":     feedback.get("skills_feedback",     ""),
                 "experience": feedback.get("experience_feedback", ""),
                 "projects":   feedback.get("projects_feedback",   ""),
             }
+            skip = {"skills_feedback", "experience_feedback", "projects_feedback", "cover_letter_feedback"}
+            for k, v in feedback.items():
+                if k.endswith("_feedback") and k not in skip:
+                    result[k[:-len("_feedback")]] = str(v)
+            return result
         return {"skills": str(feedback), "experience": str(feedback), "projects": str(feedback)}
+
+    @staticmethod
+    def _load_custom_section_data(section_id: str) -> dict | None:
+        config_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "app_config.json"
+        )
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                for cs in data.get("custom_sections", []):
+                    if cs.get("id") == section_id:
+                        return cs
+        except Exception:
+            pass
+        return None

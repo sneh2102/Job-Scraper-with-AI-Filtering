@@ -107,76 +107,59 @@ def build_output_path(base_dir: str, company: str, title: str, filename: str) ->
 
 def _extract_body(latex: str) -> dict:
     """
-    Extract all sections from assembled LaTeX.
-    Reads education directly from the latex — never re-injects FIXED_EDUCATION
-    (which caused duplication on every ATS iteration).
+    Extract all sections from assembled LaTeX generically.
+    Handles both standard sections and any custom sections.
     """
     from agents.resume_builder import LATEX_PREAMBLE, FIXED_HEADER, FIXED_EDUCATION
 
     body = latex.replace(LATEX_PREAMBLE, "").replace("\\end{document}", "").strip()
 
-    found = re.findall(r'\\section\{([^}]+)\}', body)
-    logger.info("Sections found: %s", found)
+    all_matches = list(re.finditer(r'\\section\{([^}]+)\}', body))
+    logger.info("Sections found: %s", [m.group(1) for m in all_matches])
 
-    def find_sec(text, *names):
-        for name in names:
-            idx = text.find(f"\\section{{{name}}}")
-            if idx != -1:
-                return idx
-        return -1
+    if not all_matches:
+        return {
+            "header": body, "education": "", "skills": "", "experience": "", "projects": ""
+        }
 
-    edu_idx   = find_sec(body, "Education",        "EDUCATION")
-    skill_idx = find_sec(body, "Technical Skills", "Skills", "SKILLS")
-    exp_idx   = find_sec(body, "Experience",       "EXPERIENCE", "Work Experience")
-    proj_idx  = find_sec(body, "Relevant Projects","Projects",   "PROJECTS")
-
-    logger.info("Section indices — Edu: %d | Skills: %d | Exp: %d | Projects: %d",
-                edu_idx, skill_idx, exp_idx, proj_idx)
-
-    # Header = everything before first section
-    first_section = min(
-        idx for idx in [edu_idx, skill_idx, exp_idx, proj_idx] if idx > -1
-    ) if any(idx > -1 for idx in [edu_idx, skill_idx, exp_idx, proj_idx]) else -1
-
-    header = body[:first_section].strip() if first_section > 0 else FIXED_HEADER
-    if not header:
-        header = FIXED_HEADER
-
-    # Extract education from body (NOT from module variable)
-    if edu_idx > -1:
-        edu_end   = skill_idx if (skill_idx > -1 and skill_idx > edu_idx) else exp_idx
-        if edu_end == -1:
-            edu_end = exp_idx if (exp_idx > -1 and exp_idx > edu_idx) else proj_idx
-        education = body[edu_idx:edu_end].strip() if edu_end > -1 else body[edu_idx:].strip()
-    else:
-        education = FIXED_EDUCATION
-
-    # Extract skills
-    if skill_idx > -1 and exp_idx > skill_idx:
-        skills = body[skill_idx:exp_idx].strip()
-    elif skill_idx > -1:
-        skills = body[skill_idx:].strip()
-    else:
-        skills = ""
-
-    # Extract experience
-    if exp_idx > -1 and proj_idx > exp_idx:
-        experience = body[exp_idx:proj_idx].strip()
-    elif exp_idx > -1:
-        experience = body[exp_idx:].strip()
-    else:
-        experience = ""
-
-    # Extract projects
-    projects = body[proj_idx:].strip() if proj_idx > -1 else ""
-
-    return {
-        "header":     header,
-        "education":  education,
-        "skills":     skills,
-        "experience": experience,
-        "projects":   projects,
+    # Display name → section_id mapping (lowercase)
+    name_to_id = {
+        "education":       "education",
+        "technical skills": "skills",
+        "skills":           "skills",
+        "experience":       "experience",
+        "work experience":  "experience",
+        "relevant projects": "projects",
+        "projects":         "projects",
     }
+    try:
+        if os.path.exists("app_config.json"):
+            with open("app_config.json", encoding="utf-8") as f:
+                cfg_data = json.load(f)
+            for cs in cfg_data.get("custom_sections", []):
+                cs_id   = cs.get("id", "")
+                cs_name = cs.get("name", "").lower()
+                if cs_id and cs_name:
+                    name_to_id[cs_name] = cs_id
+    except Exception:
+        pass
+
+    header = body[:all_matches[0].start()].strip() or FIXED_HEADER
+
+    sections: dict = {"header": header}
+    for i, match in enumerate(all_matches):
+        display = match.group(1)
+        sec_id  = name_to_id.get(display.lower(), display.lower().replace(" ", "_"))
+        end_idx = all_matches[i + 1].start() if i + 1 < len(all_matches) else len(body)
+        sections[sec_id] = body[match.start():end_idx].strip()
+
+    sections.setdefault("education",  FIXED_EDUCATION)
+    sections.setdefault("skills",     "")
+    sections.setdefault("experience", "")
+    sections.setdefault("projects",   "")
+
+    logger.info("Extracted section keys: %s", [k for k in sections if k != "header"])
+    return sections
 
 
 def _reassemble_latex(body: dict) -> str:
@@ -188,12 +171,20 @@ def _reassemble_latex(body: dict) -> str:
         if os.path.exists("app_config.json"):
             with open("app_config.json", encoding="utf-8") as f:
                 cfg = json.load(f)
-            saved_order = cfg.get("section_order", [])
-            required    = {"education", "skills", "experience", "projects"}
-            if saved_order and set(saved_order) == required:
-                order = saved_order
+            saved_order = (
+                cfg.get("section_order")
+                or cfg.get("pipeline", {}).get("section_order", [])
+            )
+            if saved_order:
+                order = list(saved_order)
     except Exception:
         pass
+
+    # Append any custom section keys present in body that aren't in order
+    base_keys = {"header", "education", "skills", "experience", "projects"}
+    for key in body:
+        if key not in base_keys and key not in order and body[key].strip():
+            order.append(key)
 
     result = LATEX_PREAMBLE + "\n\n" + body.get("header", "")
     for key in order:

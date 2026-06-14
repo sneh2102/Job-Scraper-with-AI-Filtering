@@ -25,11 +25,12 @@ OUTPUT FORMAT:
   "total_jd_keywords": 20,
   "matched_keywords": 14,
   "missing_keywords": ["keyword1", "keyword2"],
-  "section_scores": {"skills": 80, "experience": 70, "projects": 75},
-  "sections_to_rewrite": ["experience"],
+  "section_scores": {"skills": 80, "experience": 70, "projects": 75, "summary": 60},
+  "sections_to_rewrite": ["experience", "summary"],
   "skills_feedback": "Add Terraform to Cloud. Add Datadog to Tools.",
   "experience_feedback": "TeleAI bullet 2: add event-driven metric.",
   "projects_feedback": "Replace weakest project with Kafka streaming project.",
+  "summary_feedback": "Make it more punchy and focus on cloud expertise.",
   "cover_letter_feedback": "",
   "suggestions": ["Add Terraform", "Add CI/CD metrics", "Replace weakest project"]
 }
@@ -40,7 +41,14 @@ SCORING RULES:
 - Experience Alignment 25pts: max 8pt deduction for 3yr vs 5yr gap only
 - Skills Section 20pts: categories mirror JD domains
 - Impact/Metrics 15pts: quantified bullets score higher
-- Only TECHNICAL skills as missing_keywords — ignore soft skills, mission statements"""
+- Only TECHNICAL skills as missing_keywords — ignore soft skills, mission statements
+
+DYNAMIC SECTIONS:
+The resume may contain custom sections (e.g. "Summary", "Achievements").
+1. Include these in "section_scores" if they exist.
+2. Provide feedback for them using the format "[section_id]_feedback".
+3. If they are poor or missing key JD requirements, add them to "sections_to_rewrite".
+"""
 
 # ══════════════════════════════════════════════════════════════
 # DEFAULT USER PROMPT
@@ -321,7 +329,7 @@ class ATSCheckerAgent:
     @staticmethod
     def _build(data: dict) -> dict:
         score = int(data.get("score", 70))
-        return {
+        result = {
             "score":                score,
             "keyword_coverage_pct": int(data.get("keyword_coverage_pct", 0)),
             "pass":                 bool(data.get("pass", False)) or score >= 85,
@@ -330,12 +338,13 @@ class ATSCheckerAgent:
             "missing_keywords":     data.get("missing_keywords", []),
             "section_scores":       data.get("section_scores", {}),
             "sections_to_rewrite":  data.get("sections_to_rewrite", []),
-            "skills_feedback":      str(data.get("skills_feedback",      "")),
-            "experience_feedback":  str(data.get("experience_feedback",  "")),
-            "projects_feedback":    str(data.get("projects_feedback",    "")),
-            "cover_letter_feedback":str(data.get("cover_letter_feedback","")),
             "suggestions":          data.get("suggestions", []),
         }
+        # Capture all feedback fields dynamically
+        for k, v in data.items():
+            if k.endswith("_feedback"):
+                result[k] = str(v)
+        return result
 
     @staticmethod
     def _regex_extract(text: str) -> dict:
@@ -349,25 +358,33 @@ class ATSCheckerAgent:
             m = re.search(pat, text, re.DOTALL)
             return re.findall(r'"([^"]+)"', m.group(1)) if m else []
         score = get_int(r'"score"\s*:\s*(\d+)', 0)
-        return {
+
+        result = {
             "score":                score,
             "keyword_coverage_pct": get_int(r'"keyword_coverage_pct"\s*:\s*(\d+)', 0),
             "pass":                 score >= 85,
             "total_jd_keywords":    get_int(r'"total_jd_keywords"\s*:\s*(\d+)', 0),
             "matched_keywords":     get_int(r'"matched_keywords"\s*:\s*(\d+)', 0),
             "missing_keywords":     get_list(r'"missing_keywords"\s*:\s*\[([^\]]*)\]'),
-            "section_scores": {
-                "skills":     get_int(r'"skills"\s*:\s*(\d+)',     score),
-                "experience": get_int(r'"experience"\s*:\s*(\d+)', score),
-                "projects":   get_int(r'"projects"\s*:\s*(\d+)',   score),
-            },
+            "section_scores":       {},
             "sections_to_rewrite":  get_list(r'"sections_to_rewrite"\s*:\s*\[([^\]]*)\]'),
-            "skills_feedback":      get_str(r'"skills_feedback"\s*:\s*"([^"]*)"',     ""),
-            "experience_feedback":  get_str(r'"experience_feedback"\s*:\s*"([^"]*)"', ""),
-            "projects_feedback":    get_str(r'"projects_feedback"\s*:\s*"([^"]*)"',   ""),
-            "cover_letter_feedback": "",
             "suggestions":          get_list(r'"suggestions"\s*:\s*\[([^\]]*)\]'),
         }
+
+        # Extract all section scores: "section": score
+        scores_match = re.search(r'"section_scores"\s*:\s*\{([^}]*)\}', text)
+        if scores_match:
+            items = scores_match.group(1).split(",")
+            for item in items:
+                m = re.search(r'"([^"]+)"\s*:\s*(\d+)', item)
+                if m: result["section_scores"][m.group(1)] = int(m.group(2))
+
+        # Extract all feedback: "key_feedback": "value"
+        feedback_matches = re.finditer(r'"([^"]*_feedback)"\s*:\s*"([^"]*)"', text)
+        for m in feedback_matches:
+            result[m.group(1)] = m.group(2)
+
+        return result
 
     @staticmethod
     def _sanitize(s: str) -> str:
