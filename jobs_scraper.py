@@ -31,7 +31,7 @@ def scrape_all_jobs(
         sites = ["indeed", "glassdoor", "jobright"]
 
     # Remove unsupported sites
-    supported = {"indeed", "glassdoor", "linkedin", "zip_recruiter",
+    supported = {"indeed", "glassdoor", "linkedin", "ziprecruiter",
                  "google", "jobright", "naukri", "bayt", "bdjobs"}
     valid_sites = [s for s in sites if s in supported]
     dropped = [s for s in sites if s not in supported]

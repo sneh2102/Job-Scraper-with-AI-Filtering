@@ -77,7 +77,7 @@ def build_fixed_header(profile: dict, location_override: str = None, include_lin
     if phone:
         ph_clean = phone.replace(" ", "").replace("-", "").replace("(","").replace(")","")
         contact_parts.append(
-            f"\\href{{tel:{ph_clean}}}{{\\raisebox{{-0.2\\height}}\\faPhone*\\ \\underline{{{phone}}}}}"
+            f"\\href{{tel:{ph_clean}}}{{\\raisebox{{-0.2\\height}}\\faPhone\\ \\underline{{{phone}}}}}"
         )
     if email:
         contact_parts.append(

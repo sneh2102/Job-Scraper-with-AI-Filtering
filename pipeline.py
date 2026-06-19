@@ -357,7 +357,7 @@ def main(stop_event=None):
     output_dir    = os.getenv("OUTPUT_DIR",    pipe_cfg.get("output_dir",    "outputs"))
     resume_path   = os.getenv("RESUME_PATH",   pipe_cfg.get("resume_path",   "resume.txt"))
     projects_path = os.getenv("PROJECTS_PATH", pipe_cfg.get("projects_path", "Projects.txt"))
-    model         = os.getenv("MODEL",         app_cfg.get("model", {}).get("name", "gemma4:31b-cloud"))
+    model         = os.getenv("MODEL",         app_cfg.get("model", {}).get("pipeline", "gemma4:31b-cloud"))
 
     max_iterations = int(pipe_cfg.get("max_ats_iterations", 2))
     pass_threshold = int(pipe_cfg.get("ats_pass_threshold", 85))

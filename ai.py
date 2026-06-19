@@ -14,7 +14,7 @@ from setup_wizard import load_profile, build_profile_prompt_context
 class OllamaAssistant:
     def __init__(self, model="gemma4:31b-cloud"):
         self.model = model
-        api_key = os.environ.get("OLLAMA_API_KEY", "81fba5b4157b416681be0922f413dcb3.OyX9vz7_ERoW9yUdd27FfBUr")
+        api_key = os.environ.get("OLLAMA_API_KEY")
 
         # Use cloud host if model ends with -cloud or API key is set
         if api_key or model.endswith("-cloud"):
@@ -32,7 +32,7 @@ class OllamaAssistant:
             messages=[{"role": "user", "content": prompt}],
             stream=False,
             options={
-                "num_predict": 16384,      # ← unlimited
+                "num_predict": 64384,      # ← unlimited
                 "num_ctx":     32768,   # ← large context
                 "temperature": 0.3,
             },

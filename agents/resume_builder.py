@@ -77,7 +77,7 @@ FIXED_HEADER = r"""
 \begin{center}
     {\Huge \scshape Your Name} \\ \vspace{6pt}
     \vspace{2pt}
-    \href{tel:+10000000000}{\raisebox{-0.2\height}\faPhone*\ \underline{+1 (000) 000-0000}} ~
+    \href{tel:+10000000000}{\raisebox{-0.2\height}\faPhone\ \underline{+1 (000) 000-0000}} ~
     \href{mailto:your@email.com}{\raisebox{-0.2\height}\faEnvelope\ \underline{your@email.com}}
 \end{center}
 \vspace{2pt}

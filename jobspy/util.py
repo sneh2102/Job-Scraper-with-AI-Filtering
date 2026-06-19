@@ -298,6 +298,10 @@ def extract_job_type(description: str):
 
 
 def map_str_to_site(site_name: str) -> Site:
+    lower = site_name.strip().lower()
+    for site in Site:
+        if site.value == lower:
+            return site
     return Site[site_name.upper()]
 
 

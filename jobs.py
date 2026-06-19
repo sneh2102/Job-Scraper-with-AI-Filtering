@@ -17,8 +17,10 @@ from jobs_scraper import *
 
 required_columns = [
     "AI_recommendation",
+    "site",
     "company",
     "title",
+    "location",
     "link",
     "years_required",
     "role_level",
@@ -145,7 +147,7 @@ def load_df():
         df = pd.read_excel(excel_file, engine="openpyxl")
         for col in required_columns:
             if col not in df.columns:
-                df[col] = ""
+                df[col] = "" if col != "site" else "Unknown"
         return df
     else:
         return pd.DataFrame(columns=required_columns)
@@ -283,15 +285,23 @@ def scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text, prom
                 os.getenv("results_wanted"),
                 offset,
             )
-            logging a a...
-... [truncated] ...
+            logging.info(f"Scraped {len(new_data)} jobs.")
+        except Exception as e:
+            logging.error("Scraping error: %s\n%s", e, traceback.format_exc())
+            new_data = pd.DataFrame(columns=required_columns)
+
+        for _, row in tqdm(new_data.iterrows(), total=len(new_data), desc="Analyzing Jobs"):
+            try:
+                job_url = row.get("job_url", "")
+                if job_url in unique_urls:
+                    continue
+
                 msg = format_prompt(
                     prompt_template,
                     title=row.get("title", ""),
                     description=row.get("description", ""),
                     resume_text=resume_text,
                 )
-... [truncated] ...
 
                 ai_response = send_with_retries(assistant, msg, tries=3, backoff_sec=1.5)
                 logging.info("Ollama response received.")
@@ -300,8 +310,10 @@ def scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text, prom
 
                 new_row = {
                     "AI_recommendation": result["verdict"],
+                    "site":              row.get("site", "Unknown"),
                     "company":           row.get("company", ""),
                     "title":             row.get("title", ""),
+                    "location":          row.get("location", ""),
                     "link":              job_url,
                     "years_required":    result["years_required"],
                     "role_level":        result["role_level"],
@@ -363,7 +375,7 @@ def main():
     # Inject candidate profile into the prompt
     prompt_template = prompt_template.replace("{candidate_profile}", profile_ctx)
 
-    assistant = OllamaAssistant(model=os.getenv("model", "gemma3:e4b"))
+    assistant = OllamaAssistant(model=os.getenv("model", "gemma4:31b-cloud"))
     logging.info(f"Ollama Assistant ready using model: {assistant.model}")
 
     new_df = scrape_and_filter_ai(unique_urls, assistant, instructions, resume_text, prompt_template)

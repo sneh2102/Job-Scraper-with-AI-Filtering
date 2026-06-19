@@ -32,33 +32,72 @@ from jobspy.model import (
 
 log = create_logger("Glassdoor")
 KNOWN_LOCATIONS = {
-    # ── Canada — Verified from glassdoor.ca URLs ────────────────────
-    "toronto":       (2281069, "CITY"),
-    "vancouver":     (2278756, "CITY"),
-    "halifax":       (2290928, "CITY"),
-    "montreal":      (2296722, "CITY"),
-    "calgary":       (2275123, "CITY"),
-    "ottawa":        (2286068, "CITY"),
-    "canada":        (16,      "COUNTRY"),
+    # ── Canada (country ID verified via GraphQL test) ────────────────
+    "canada":               (3,        "COUNTRY"),
+    "toronto":              (2281069,  "CITY"),
+    "vancouver":            (2278756,  "CITY"),
+    "halifax":              (2290928,  "CITY"),
+    "dartmouth":            (2290928,  "CITY"),   # same metro as Halifax
+    "montreal":             (2296722,  "CITY"),
+    "calgary":              (2275123,  "CITY"),
+    "ottawa":               (2286068,  "CITY"),
+    "edmonton":             (2276227,  "CITY"),
+    "winnipeg":             (2283271,  "CITY"),
+    "nova scotia":          (3,        "COUNTRY"),  # province-level not exposed; fall back to Canada
+    "new brunswick":        (3,        "COUNTRY"),
+    "ontario":              (3,        "COUNTRY"),
+    "british columbia":     (3,        "COUNTRY"),
+    "alberta":              (3,        "COUNTRY"),
+    "quebec":               (3,        "COUNTRY"),
+    "prince edward island": (3,        "COUNTRY"),
+    "pei":                  (3,        "COUNTRY"),
+    "newfoundland":         (3,        "COUNTRY"),
+    "saskatchewan":         (3,        "COUNTRY"),
+    "manitoba":             (3,        "COUNTRY"),
 
-    # ── Canada Atlantic ─────────────────────────────────────────────
-    "dartmouth":     (2290928, "CITY"),   # same metro as Halifax for now
-    "nova scotia":   (13069,   "STATE"),
-    "new brunswick": (13064,   "STATE"),
-    "pei":           (13068,   "STATE"),
-    "prince edward island": (13068, "STATE"),
-    "newfoundland":  (13065,   "STATE"),
+    # ── United Kingdom (verified) ────────────────────────────────────
+    "united kingdom":       (2,        "COUNTRY"),
+    "uk":                   (2,        "COUNTRY"),
 
-    # ── India ───────────────────────────────────────────────────────
-    "india":         (115,     "COUNTRY"),
+    # ── Australia (verified) ─────────────────────────────────────────
+    "australia":            (16,       "COUNTRY"),
 
-    # ── USA ─────────────────────────────────────────────────────────
-    "new york":      (1132348, "CITY"),
-    "san francisco": (1147401, "CITY"),
-    "seattle":       (1150505, "CITY"),
-    "chicago":       (1128808, "CITY"),
-    "austin":        (1139761, "CITY"),
-    "remote":        (11047,   "STATE"),
+    # ── India (country + city metro IDs verified via GraphQL scan) ──
+    "india":                (115,      "COUNTRY"),
+    "bangalore":            (1091,     "METRO"),
+    "bengaluru":            (1091,     "METRO"),
+    "mumbai":               (1070,     "METRO"),
+    "pune":                 (1072,     "METRO"),
+    "hyderabad":            (1076,     "METRO"),
+    "chennai":              (1067,     "METRO"),
+    "delhi":                (1093,     "METRO"),
+    "new delhi":            (1093,     "METRO"),
+    "noida":                (1083,     "METRO"),
+    "ncr":                  (1083,     "METRO"),
+    "ahmedabad":            (1090,     "METRO"),
+    "kolkata":              (115,      "COUNTRY"),   # metro ID not found, fall back to country
+    "gurgaon":              (115,      "COUNTRY"),
+    "gurugram":             (115,      "COUNTRY"),
+
+    # ── Germany (verified) ───────────────────────────────────────────
+    "germany":              (96,       "COUNTRY"),
+
+    # ── UAE / Gulf ───────────────────────────────────────────────────
+    "uae":                  (6,        "COUNTRY"),
+    "dubai":                (6,        "COUNTRY"),
+    "united arab emirates": (6,        "COUNTRY"),
+
+    # ── USA (verified) ───────────────────────────────────────────────
+    "usa":                  (1,        "COUNTRY"),
+    "united states":        (1,        "COUNTRY"),
+    "new york":             (1132348,  "CITY"),
+    "san francisco":        (1147401,  "CITY"),
+    "seattle":              (1150505,  "CITY"),
+    "chicago":              (1128808,  "CITY"),
+    "austin":               (1139761,  "CITY"),
+
+    # ── Remote ───────────────────────────────────────────────────────
+    "remote":               (11047,    "STATE"),
 }
 class Glassdoor(Scraper):
     def __init__(
@@ -85,7 +124,10 @@ class Glassdoor(Scraper):
     def scrape(self, scraper_input: ScraperInput) -> JobResponse:
         self.scraper_input = scraper_input
         self.scraper_input.results_wanted = min(900, scraper_input.results_wanted)
-        self.base_url = self.scraper_input.country.get_glassdoor_url()
+        # Always use .com for API calls — cookies from the browser session are from
+        # www.glassdoor.com and cf_clearance is domain-specific. Location filtering
+        # is done entirely through the locationId in the GraphQL payload, not the domain.
+        self.base_url = "https://www.glassdoor.com"
 
         self.session = create_session(
             proxies=self.proxies, ca_cert=self.ca_cert, has_retry=True, is_tls=False
@@ -196,7 +238,7 @@ class Glassdoor(Scraper):
         Processes a single job and fetches its description.
         """
         job_id = job_data["jobview"]["job"]["listingId"]
-        job_url = f"{self.base_url}job-listing/j?jl={job_id}"
+        job_url = f"{self.base_url}/job-listing/j?jl={job_id}"
         if job_url in self.seen_urls:
             return None
         self.seen_urls.add(job_url)
@@ -221,7 +263,7 @@ class Glassdoor(Scraper):
             description = self._fetch_job_description(job_id)
         except:
             description = None
-        company_url = f"{self.base_url}Overview/W-EI_IE{company_id}.htm"
+        company_url = f"{self.base_url}/Overview/W-EI_IE{company_id}.htm"
         company_logo = (
             job_data["jobview"].get("overview", {}).get("squareLogoUrl", None)
         )
@@ -276,7 +318,7 @@ class Glassdoor(Scraper):
                 """,
             }
         ]
-        res = requests.post(url, json=body, headers=headers)
+        res = self.session.post(url, json=body, headers=headers)
         if res.status_code != 200:
             return None
         data = res.json()[0]
@@ -290,36 +332,48 @@ class Glassdoor(Scraper):
     
 
     def _get_location(self, location: str, is_remote: bool) -> tuple:
-        if not location or is_remote:
-            return "11047", "STATE"
+        if is_remote:
+            return 11047, "STATE"   # Glassdoor "Remote" pseudo-state (US-hosted but returns remote globally)
 
-        # Check hardcoded map first — bypasses Cloudflare-blocked endpoint
-        key = location.strip().lower()
+        key = location.strip().lower() if location else ""
+
+        # 1. Exact match in hardcoded table
         if key in KNOWN_LOCATIONS:
             loc_id, loc_type = KNOWN_LOCATIONS[key]
-            log.info(f"Glassdoor: using known location id={loc_id}, type={loc_type} for '{location}'")
+            log.info(f"Glassdoor: exact match '{key}' -> id={loc_id}, type={loc_type}")
             return loc_id, loc_type
 
-        # Try partial match (e.g. "Bangalore, India" -> "bangalore")
+        # 2. Partial match — e.g. "Halifax, Nova Scotia, Canada" contains "halifax"
         for known_key, (loc_id, loc_type) in KNOWN_LOCATIONS.items():
             if known_key in key:
                 log.info(f"Glassdoor: partial match '{known_key}' -> id={loc_id}, type={loc_type}")
                 return loc_id, loc_type
 
-        # Fallback: try the live endpoint (may be blocked)
-        url = f"{self.base_url}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
-        try:
-            res = self.session.get(url, timeout=10)
-            if res.status_code == 200:
-                items = res.json()
-                if items:
-                    raw_type = items[0]["locationType"]
-                    loc_type = {"C": "CITY", "S": "STATE", "N": "COUNTRY"}.get(raw_type, raw_type)
-                    return int(items[0]["locationId"]), loc_type
-        except Exception as e:
-            log.warning(f"Glassdoor live location lookup failed: {e}")
+        # 3. Live endpoint (may be Cloudflare-blocked but worth trying)
+        if key:
+            url = f"{self.base_url}/findPopularLocationAjax.htm?maxLocationsToReturn=10&term={location}"
+            try:
+                res = self.session.get(url, timeout=10)
+                if res.status_code == 200:
+                    items = res.json()
+                    if items:
+                        raw_type = items[0]["locationType"]
+                        loc_type = {"C": "CITY", "S": "STATE", "N": "COUNTRY"}.get(raw_type, raw_type)
+                        loc_id   = int(items[0]["locationId"])
+                        log.info(f"Glassdoor: live lookup '{location}' -> id={loc_id}, type={loc_type}")
+                        return loc_id, loc_type
+            except Exception as e:
+                log.warning(f"Glassdoor live location lookup failed: {e}")
 
-        log.error(f"Glassdoor: could not resolve location '{location}'")
+        # 4. No location given or lookup failed — fall back to the scraper's country
+        country = self.scraper_input.country
+        country_key = country.value[0].split(",")[0].strip().lower() if country else ""
+        if country_key in KNOWN_LOCATIONS:
+            loc_id, loc_type = KNOWN_LOCATIONS[country_key]
+            log.info(f"Glassdoor: no location given, using country fallback '{country_key}' -> id={loc_id}, type={loc_type}")
+            return loc_id, loc_type
+
+        log.error(f"Glassdoor: could not resolve location '{location}' — returning None")
         return None, None
 
     def _add_payload(self, location_id, location_type, page_num, cursor=None):

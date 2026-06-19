@@ -72,7 +72,7 @@ class RotatingOllamaClient:
                     ],
                     stream=False,
                     options={
-                        "num_predict": 16384,
+                        "num_predict": 64384,
                         "num_ctx":     32768,
                         "temperature": 0.3,
                     },

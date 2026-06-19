@@ -22,7 +22,7 @@ def get_glassdoor_location(location_term: str) -> tuple[int | None, str | None]:
                         raw_type = data[0]["locationType"]
                         result["id"]   = data[0]["locationId"]
                         result["type"] = {"C": "CITY", "S": "STATE", "N": "COUNTRY"}.get(raw_type, raw_type)
-                        print(f"  [Playwright] ✅ Location: id={result['id']}, type={result['type']}, name={data[0].get('locationName','?')}")
+                        print(f"  [Playwright] OK Location: id={result['id']}, type={result['type']}, name={data[0].get('locationName','?')}")
                 except Exception as e:
                     print(f"  [Playwright] Location parse error: {e}")
 
@@ -65,9 +65,9 @@ def get_glassdoor_cookies_and_token() -> tuple[dict, str | None, str]:
         matches = re.findall(r'"token":\s*"([^"]+)"', html)
         if matches:
             token = matches[0]
-            print(f"  [Playwright] ✅ CSRF token: {token[:40]}...")
+            print(f"  [Playwright] OK CSRF token: {token[:40]}...")
         else:
-            print("  [Playwright] ❌ CSRF token not found, will use fallback")
+            print("  [Playwright] NO CSRF token found, will use fallback")
 
         cookies = context.cookies()
         cookies_dict = {c["name"]: c["value"] for c in cookies}
