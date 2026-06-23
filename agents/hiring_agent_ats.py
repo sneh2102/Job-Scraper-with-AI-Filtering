@@ -39,7 +39,7 @@ _SYSTEM_PROMPT = """You are an expert technical recruiter evaluating resumes. Pr
 
 **MANDATORY: You MUST always fill ALL THREE categories: self_projects, production, technical_skills.**
 
-- For self_projects: Assess project complexity and impact. Simple tutorial projects (todo lists, calculators, basic CRUD apps) should receive LOW SCORES. Complex projects with real-world impact, multiple technologies, or measurable outcomes should receive HIGH SCORES. Deduct for projects without GitHub links or live demos.
+- For self_projects: Assess project complexity and impact. Simple tutorial projects (todo lists, calculators, basic CRUD apps) should receive LOW SCORES. Complex projects with real-world impact, multiple technologies, or measurable outcomes should receive HIGH SCORES.
 
 - For production: Analyze work and volunteer sections for real-world, internship, or production experience. Give extra points for founder roles or early-stage engineer roles at startups.
 
@@ -77,7 +77,6 @@ _USER_PROMPT_TEMPLATE = """Evaluate this resume and score it across three catego
 - MEDIUM (15-29): Moderate complexity, good documentation, multiple features
 - LOW (1-14): Simple tutorial projects (todo lists, calculators, basic CRUD, weather apps)
 - ZERO: No projects or only extremely basic ones
-Deduct 3-5 pts per project missing a GitHub link or live demo.
 
 ### Production Experience (0-40 points)
 Score work/volunteer sections. Give extra credit for startup founder/early engineer roles.
