@@ -14,53 +14,55 @@ from jobspy.model import (
     JobType,
 )
 from jobspy.util import extract_emails_from_text, extract_job_type
-from jobspy.google.util import log, find_job_info_initial_page, find_job_info
+from jobspy.google.util import log
 
-# JavaScript run inside Playwright to extract job cards from the rendered DOM.
+# JavaScript run inside Playwright to extract job card metadata (no clicking needed).
+#
 # Selectors confirmed from live Google Jobs HTML (June 2025):
 #   Card container : [data-preview-id]
 #   Title          : .tNxQIb.PUpOsf
 #   Company        : .wHYlTd.MKCbgd.a3jPc
 #   Location+source: .wHYlTd.FqK3wc.MKCbgd
-#   Date           : span.Yf9oye  (inner span.Yf9oye > span[aria-hidden])
+#   Date           : span.Yf9oye > span[aria-hidden]
+#
+# Descriptions require clicking each card. Google uses a horizontal carousel
+# in the right panel: active description is always at the column with the
+# smallest left > viewport_width/2. _GET_ACTIVE_DESC_JS extracts it.
 _EXTRACT_JS = """
 () => {
     const results = [];
-    const seen = new Set();
+    const seen    = new Set();
     const baseUrl = 'https://www.google.com/search';
+    const cards   = Array.from(document.querySelectorAll('[data-preview-id]'));
 
-    const cards = Array.from(document.querySelectorAll('[data-preview-id]'));
     for (const card of cards) {
         const previewId = card.getAttribute('data-preview-id') || '';
 
-        const titleEl   = card.querySelector('.tNxQIb.PUpOsf');
-        const compEl    = card.querySelector('.wHYlTd.MKCbgd.a3jPc');
-        const locEl     = card.querySelector('.wHYlTd.FqK3wc.MKCbgd');
-        const dateEl    = card.querySelector('span.Yf9oye span[aria-hidden]');
-        const salaryEl  = card.querySelector('.I2Cbhb');
+        const titleEl  = card.querySelector('.tNxQIb.PUpOsf');
+        const compEl   = card.querySelector('.wHYlTd.MKCbgd.a3jPc');
+        const locEl    = card.querySelector('.wHYlTd.FqK3wc.MKCbgd');
+        const dateEl   = card.querySelector('span.Yf9oye span[aria-hidden]');
+        const salaryEl = card.querySelector('.I2Cbhb');
 
-        const title    = titleEl  ? titleEl.innerText.trim()  : null;
-        const company  = compEl   ? compEl.innerText.trim()   : null;
-        const locRaw   = locEl    ? locEl.innerText.trim()    : '';
-        const date     = dateEl   ? dateEl.innerText.trim()   : null;
-        const salary   = salaryEl ? salaryEl.innerText.trim() : null;
+        const title   = titleEl  ? titleEl.innerText.trim()  : null;
+        const company = compEl   ? compEl.innerText.trim()   : null;
+        const locRaw  = locEl    ? locEl.innerText.trim()    : '';
+        const date    = dateEl   ? dateEl.innerText.trim()   : null;
+        const salary  = salaryEl ? salaryEl.innerText.trim() : null;
 
         if (!title || !company) continue;
         const key = title + '|' + company;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        // Location and via-source are in the same element separated by " • via "
         let location = locRaw, source = '';
         const viaIdx = locRaw.indexOf(' via ');
         if (viaIdx > -1) {
             location = locRaw.substring(0, viaIdx).trim();
             source   = locRaw.substring(viaIdx + 5).trim();
         }
-        // Clean up bullet separator that sometimes appears
-        location = location.replace(/[•∙]/g, '').trim();
+        location = location.replace(/[•∙·]/g, '').trim();
 
-        // Build a Google Jobs detail URL from the preview ID
         const jobUrl = previewId
             ? baseUrl + '?q=' + encodeURIComponent(title + ' ' + company) + '&udm=8&jid=' + previewId
             : baseUrl + '?q=' + encodeURIComponent(title + ' ' + company + ' jobs') + '&udm=8';
@@ -71,19 +73,62 @@ _EXTRACT_JS = """
 }
 """
 
-_MORE_BTN_JS = """
+# After clicking a job card, Google slides the description into the right panel as a
+# horizontal carousel. The active description sits at the column with the smallest
+# left > viewport_width/2.
+#
+# Returns { text, applyUrl } where applyUrl is the actual hiring-site URL extracted
+# from the topmost external link in the right panel (the "Apply on [X]" button).
+_GET_ACTIVE_DESC_JS = """
 () => {
-    // Google 2025: the 'More jobs' button lives near [jsname='iTtkOe']
-    // Also try any visible button / div with 'More jobs' text
-    const candidates = Array.from(document.querySelectorAll('[role="button"], button, a'));
-    for (const el of candidates) {
-        const txt = (el.innerText || el.textContent || '').trim();
-        if (txt === 'More jobs' && el.offsetParent !== null) {
-            el.click();
-            return true;
+    const halfVW = window.innerWidth / 2;
+
+    // --- Apply URL: topmost external link in the right-panel column ---
+    function unwrapGoogleRedirect(href) {
+        if (href && href.includes('google.com/url')) {
+            const m = href.match(/[?&]q=([^&]+)/);
+            if (m) return decodeURIComponent(m[1]);
+        }
+        return href;
+    }
+
+    const rightLinks = Array.from(document.querySelectorAll('a[href]'))
+        .filter(a => {
+            const r = a.getBoundingClientRect();
+            return r.left >= halfVW && r.width > 10 && r.height > 0;
+        })
+        .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+    let applyUrl = '';
+    for (const a of rightLinks) {
+        let href = unwrapGoogleRedirect(a.getAttribute('href') || a.href || '');
+        if (href.startsWith('http') && !href.includes('google.com')) {
+            applyUrl = href;
+            break;
         }
     }
-    return false;
+
+    // --- Description: active .XFOJCe block in the right half ---
+    const allX   = Array.from(document.querySelectorAll('.XFOJCe'));
+    const inPanel = allX.filter(x => {
+        const r = x.getBoundingClientRect();
+        return r.left >= halfVW && r.width > 50;
+    });
+    inPanel.sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
+
+    let text = '';
+    for (const x of inPanel) {
+        const h2 = x.querySelector('h2');
+        const heading = (h2 ? h2.innerText : '').toLowerCase().trim();
+        if (heading === 'report this listing' || heading.startsWith('report')) continue;
+
+        const vis = x.querySelector('[jsname="QAWWu"]');
+        const hid = x.querySelector('[jsname="ij8cu"]');
+        const t = ((vis ? vis.innerText : '') + ' ' + (hid ? hid.textContent : '')).trim();
+        if (t.length > 30) { text = t; break; }
+    }
+
+    return { text, applyUrl };
 }
 """
 
@@ -141,6 +186,8 @@ class Google(Scraper):
         )
 
         jobs: list[JobPost] = []
+        processed_ids: set[str] = set()
+        panel_ready = False
 
         with sync_playwright() as p:
             # launch_persistent_context keeps cookies / localStorage between runs
@@ -176,20 +223,24 @@ class Google(Scraper):
 
                 page.wait_for_timeout(2_500)
 
-                page_num = 1
+                # Google uses infinite scroll: cards load lazily as the user scrolls.
+                # We scroll to the bottom repeatedly until we have enough jobs.
                 while len(jobs) < results_wanted:
-                    log.info(f"Google: parsing page {page_num}")
-                    new_jobs = self._scrape_page(page)
+                    log.info(f"Google: extracting (have {len(jobs)}/{results_wanted}, seen {len(processed_ids)} cards)")
+                    new_jobs, panel_ready = self._extract_from_dom(page, processed_ids, panel_ready)
+                    before = len(jobs)
                     for j in new_jobs:
                         if j.job_url not in self.seen_urls:
                             self.seen_urls.add(j.job_url)
                             jobs.append(j)
+                    log.info(f"Google: +{len(jobs) - before} new jobs this pass")
 
                     if len(jobs) >= results_wanted:
                         break
-                    if not self._click_more(page):
+
+                    if not self._scroll_for_more(page, len(processed_ids)):
+                        log.info("Google: no additional cards after scrolling — stopping")
                         break
-                    page_num += 1
 
             except Exception as exc:
                 log.error(f"Google scrape error: {exc}")
@@ -201,120 +252,95 @@ class Google(Scraper):
         return JobResponse(jobs=jobs[offset: offset + results_wanted])
 
     # ------------------------------------------------------------------
-    # Per-page extraction: JSON first, DOM fallback
+    # DOM extraction (click each card for its description)
     # ------------------------------------------------------------------
 
-    def _scrape_page(self, page) -> list[JobPost]:
-        html = page.content()
-
-        # Try Google's internal JSON format (works when page is rendered by a real browser)
-        json_jobs = self._extract_from_json(html)
-        if json_jobs:
-            log.info(f"Google: extracted {len(json_jobs)} jobs via JSON")
-            return json_jobs
-
-        # Fall back to DOM extraction
-        dom_jobs = self._extract_from_dom(page)
-        log.info(f"Google: extracted {len(dom_jobs)} jobs via DOM")
-        return dom_jobs
-
-    def _extract_from_json(self, html: str) -> list[JobPost]:
-        jobs_raw = find_job_info_initial_page(html)
-        jobs = []
-        for raw in jobs_raw:
-            try:
-                job = self._parse_json_job(raw)
-                if job:
-                    jobs.append(job)
-            except Exception as exc:
-                log.debug(f"JSON job parse error: {exc}")
-        return jobs
-
-    def _extract_from_dom(self, page) -> list[JobPost]:
+    def _extract_from_dom(
+        self, page, processed_ids: set, panel_ready: bool
+    ) -> tuple[list[JobPost], bool]:
         try:
             raw_list = page.evaluate(_EXTRACT_JS) or []
         except Exception as exc:
             log.warning(f"DOM JS evaluate error: {exc}")
-            raw_list = []
+            return [], panel_ready
 
         now = datetime.now()
         jobs = []
-        for rd in raw_list:
+
+        for i, rd in enumerate(raw_list):
+            preview_id = rd.get("previewId", "")
+
+            # Skip cards we already processed in a previous scroll batch
+            if preview_id and preview_id in processed_ids:
+                continue
+            if preview_id:
+                processed_ids.add(preview_id)
+
+            description = ""
+            if preview_id:
+                try:
+                    card = page.query_selector(f'[data-preview-id="{preview_id}"]')
+                    if card:
+                        card.click()
+                        if not panel_ready:
+                            # First ever click: wait for the carousel panel to appear
+                            page.wait_for_selector(".XFOJCe", timeout=8_000)
+                            page.wait_for_timeout(800)
+                            panel_ready = True
+                        else:
+                            # Carousel slides in ~300 ms; 900 ms gives comfortable margin
+                            page.wait_for_timeout(900)
+                        result = page.evaluate(_GET_ACTIVE_DESC_JS) or {}
+                        description = result.get("text", "") if isinstance(result, dict) else str(result)
+                        apply_url   = result.get("applyUrl", "") if isinstance(result, dict) else ""
+                        if apply_url:
+                            rd["url"] = apply_url  # replace Google search URL with real job URL
+                except Exception as exc:
+                    log.debug(f"Description click error for card {i}: {exc}")
+
+            rd["description"] = description
             try:
                 job = self._parse_dom_job(rd, now)
                 if job:
                     jobs.append(job)
             except Exception as exc:
                 log.debug(f"DOM job parse error: {exc}")
-        return jobs
+
+        return jobs, panel_ready
 
     # ------------------------------------------------------------------
-    # Pagination
+    # Infinite-scroll pagination
     # ------------------------------------------------------------------
 
-    def _click_more(self, page) -> bool:
+    def _scroll_for_more(self, page, current_count: int) -> bool:
+        """Scroll the job list to trigger Google's lazy card loading.
+        Uses mouse.wheel (most human-like) in the left panel area.
+        Returns True if new [data-preview-id] cards appeared, False otherwise."""
         try:
-            clicked = page.evaluate(_MORE_BTN_JS)
-            if clicked:
-                page.wait_for_timeout(2_500)
-                return True
+            # Click the left panel (job list side) so the wheel targets it
+            page.mouse.click(300, 450)
+            page.wait_for_timeout(200)
+
+            # Scroll down in increments; try up to 3 times before giving up
+            for _ in range(3):
+                page.mouse.wheel(0, 2000)
+                page.wait_for_timeout(300)
+                try:
+                    page.wait_for_function(
+                        f"document.querySelectorAll('[data-preview-id]').length > {current_count}",
+                        timeout=4_000,
+                    )
+                    page.wait_for_timeout(500)
+                    return True
+                except Exception:
+                    pass
+            return False
         except Exception:
-            pass
-        return False
+            return False
 
     # ------------------------------------------------------------------
     # Job parsers
     # ------------------------------------------------------------------
-
-    def _parse_json_job(self, job_info: list) -> JobPost | None:
-        """Parse Google's internal positional JSON array. Uses safe access throughout."""
-        def safe(*indices, default=None):
-            try:
-                v = job_info
-                for i in indices:
-                    v = v[i]
-                return v
-            except (IndexError, TypeError, KeyError):
-                return default
-
-        job_url = safe(3, 0, 0)
-        if not job_url:
-            return None
-
-        title        = safe(0,  default="")
-        company_name = safe(1,  default="")
-        location_str = safe(2,  default="") or ""
-        days_ago_raw = safe(12, default=None)
-        description  = safe(19, default="") or ""
-        job_id_raw   = safe(28, default=job_url)
-
-        city = state = country = None
-        if location_str and "," in location_str:
-            parts = [p.strip() for p in location_str.split(",")]
-            city    = parts[0]
-            state   = parts[1] if len(parts) > 1 else None
-            country = parts[2] if len(parts) > 2 else None
-        else:
-            city = location_str
-
-        date_posted = None
-        if isinstance(days_ago_raw, str):
-            m = re.search(r"\d+", days_ago_raw)
-            if m:
-                date_posted = (datetime.now() - timedelta(days=int(m.group()))).date()
-
-        return JobPost(
-            id=f"go-{job_id_raw}",
-            title=title,
-            company_name=company_name,
-            location=Location(city=city, state=state, country=country),
-            job_url=job_url,
-            date_posted=date_posted,
-            is_remote="remote" in description.lower() or "wfh" in description.lower(),
-            description=description,
-            emails=extract_emails_from_text(description),
-            job_type=extract_job_type(description),
-        )
 
     def _parse_dom_job(self, rd: dict, now: datetime) -> JobPost | None:
         title        = (rd.get("title")    or "").strip()

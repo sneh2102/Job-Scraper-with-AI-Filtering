@@ -27,6 +27,7 @@ import shutil
 import sys
 import logging
 import time
+import re
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
@@ -664,6 +665,261 @@ class LogWidget(ctk.CTkFrame):
         self.textbox.configure(state="disabled")
 
 
+# ══════════════════════════════════════════════════════════════
+# SCRAPER VISUAL RESULTS
+# ══════════════════════════════════════════════════════════════
+
+class ScraperJobCard(ctk.CTkFrame):
+    _VERDICT = {
+        "yes":   ("#3fb950", "#1a3e2a"),
+        "maybe": ("#d29922", "#3e3200"),
+        "no":    ("#f85149", "#3e1a1a"),
+    }
+
+    def __init__(self, master, verdict: str, company: str, title: str,
+                 skills_pct: int, location: str, matched: list, missing: list, **kwargs):
+        v = verdict.lower()
+        fg, bg = self._VERDICT.get(v, ("#aaa", "#333"))
+        super().__init__(master, corner_radius=8, fg_color="#161b22",
+                         border_color=fg, border_width=1, **kwargs)
+
+        r1 = ctk.CTkFrame(self, fg_color="transparent")
+        r1.pack(fill="x", padx=10, pady=(8, 3))
+        ctk.CTkLabel(r1, text=f" {v.upper()} ",
+                     font=ctk.CTkFont(size=10, weight="bold"),
+                     fg_color=bg, text_color=fg,
+                     corner_radius=4).pack(side="left")
+        ctk.CTkLabel(r1, text=f"  {company}  ·  {title[:42]}",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#e6edf3").pack(side="left")
+        if location:
+            ctk.CTkLabel(r1, text=f"📍 {location[:28]}",
+                         font=ctk.CTkFont(size=10), text_color="#7d8590").pack(side="right")
+
+        r2 = ctk.CTkFrame(self, fg_color="transparent")
+        r2.pack(fill="x", padx=10, pady=(0, 3))
+        ctk.CTkLabel(r2, text=f"{skills_pct}%",
+                     font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color=fg, width=38, anchor="e").pack(side="left")
+        bar = ctk.CTkProgressBar(r2, height=7, corner_radius=3,
+                                  progress_color=fg, fg_color="#30363d")
+        bar.set(max(0.0, min(1.0, skills_pct / 100)))
+        bar.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        chips = (
+            [(sk, True)  for sk in (matched or [])[:4]] +
+            [(sk, False) for sk in (missing or [])[:4]]
+        )
+        if chips:
+            r3 = ctk.CTkFrame(self, fg_color="transparent")
+            r3.pack(fill="x", padx=10, pady=(0, 8))
+            for sk, ok in chips:
+                c_fg = "#3fb950" if ok else "#f85149"
+                c_bg = "#1a3e2a" if ok else "#3e1a1a"
+                ctk.CTkLabel(r3, text=f"{'✓' if ok else '✗'} {sk}",
+                             font=ctk.CTkFont(size=10),
+                             fg_color=c_bg, text_color=c_fg,
+                             corner_radius=4).pack(side="left", padx=2, pady=1)
+        else:
+            ctk.CTkFrame(self, height=5, fg_color="transparent").pack()
+
+
+class ScraperResultsPanel(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self._counts = {"total": 0, "yes": 0, "maybe": 0, "no": 0}
+        self._summary = ctk.CTkLabel(
+            self, text="Waiting for jobs...",
+            font=ctk.CTkFont(size=12), text_color="#7d8590",
+        )
+        self._summary.pack(anchor="w", pady=(0, 4))
+        self._scroll = ctk.CTkScrollableFrame(self, fg_color="#0d1117", corner_radius=8)
+        self._scroll.pack(fill="both", expand=True)
+
+    def add_job(self, data: dict):
+        v = data.get("verdict", "maybe").lower()
+        self._counts["total"] += 1
+        self._counts[v] = self._counts.get(v, 0) + 1
+        card = ScraperJobCard(
+            self._scroll,
+            verdict=v,
+            company=data.get("company", ""),
+            title=data.get("title", ""),
+            skills_pct=int(data.get("skills_pct", 0)),
+            location=data.get("location", ""),
+            matched=data.get("matched", []),
+            missing=data.get("missing", []),
+        )
+        card.pack(fill="x", padx=4, pady=(0, 4))
+        try:
+            self._scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+        t, y, m, n = (self._counts[k] for k in ("total", "yes", "maybe", "no"))
+        self._summary.configure(
+            text=f"{t} processed  |  ✓ {y} YES  |  ~ {m} MAYBE  |  ✗ {n} NO"
+        )
+
+    def clear(self):
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._counts = {"total": 0, "yes": 0, "maybe": 0, "no": 0}
+        self._summary.configure(text="Waiting for jobs...")
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE VISUAL RESULTS
+# ══════════════════════════════════════════════════════════════
+
+class PipelineJobCard(ctk.CTkFrame):
+    _STATUS = {
+        "queued":   ("⏸",  "#aaa",    "#2a2a2a"),
+        "building": ("🔨", "#58a6ff", "#0d2045"),
+        "checking": ("🔍", "#d29922", "#3e3200"),
+        "pass":     ("✅", "#3fb950", "#1a3e2a"),
+        "tex_only": ("📄", "#58d4f5", "#0a2e38"),
+        "failed":   ("❌", "#f85149", "#3e1a1a"),
+        "error":    ("⚠",  "#f85149", "#3e1a1a"),
+    }
+
+    def __init__(self, master, company: str, title: str, **kwargs):
+        super().__init__(master, corner_radius=8, fg_color="#161b22",
+                         border_color="#30363d", border_width=1, **kwargs)
+        self.company = company
+        self.title   = title
+
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=10, pady=(8, 3))
+        self._badge = ctk.CTkLabel(
+            hdr, text=" ⏸ QUEUED ",
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#2a2a2a", text_color="#aaa", corner_radius=4,
+        )
+        self._badge.pack(side="left")
+        ctk.CTkLabel(
+            hdr, text=f"  {company[:22]}  ·  {title[:35]}",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#e6edf3",
+        ).pack(side="left")
+
+        sr = ctk.CTkFrame(self, fg_color="transparent")
+        sr.pack(fill="x", padx=10, pady=(0, 3))
+        self._score_lbl = ctk.CTkLabel(
+            sr, text="ATS: --",
+            font=ctk.CTkFont(size=11), text_color="#7d8590", width=58,
+        )
+        self._score_lbl.pack(side="left")
+        self._bar = ctk.CTkProgressBar(
+            sr, height=7, corner_radius=3, fg_color="#30363d", progress_color="#30363d",
+        )
+        self._bar.set(0)
+        self._bar.pack(side="left", fill="x", expand=True, padx=(4, 0))
+
+        self._detail = ctk.CTkLabel(
+            self, text="Waiting in queue...",
+            font=ctk.CTkFont(size=10), text_color="#7d8590", anchor="w",
+        )
+        self._detail.pack(fill="x", padx=10, pady=(0, 8))
+
+    def update_status(self, status: str, score: int = 0, detail: str = ""):
+        icon, fg, bg = self._STATUS.get(status, ("●", "#aaa", "#2a2a2a"))
+        self.configure(border_color=fg)
+        self._badge.configure(text=f" {icon} {status.upper()} ", text_color=fg, fg_color=bg)
+        if score > 0:
+            self._score_lbl.configure(text=f"ATS: {score}/100", text_color=fg)
+            self._bar.configure(progress_color=fg)
+            self._bar.set(min(1.0, score / 100))
+        if detail:
+            self._detail.configure(text=detail)
+
+
+class PipelineResultsPanel(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self._cards: dict = {}
+        self._counts = {"total": 0, "done": 0, "processing": 0, "queued": 0}
+        self._summary = ctk.CTkLabel(
+            self, text="No jobs queued yet",
+            font=ctk.CTkFont(size=12), text_color="#7d8590",
+        )
+        self._summary.pack(anchor="w", pady=(0, 4))
+        self._scroll = ctk.CTkScrollableFrame(self, fg_color="#0d1117", corner_radius=8)
+        self._scroll.pack(fill="both", expand=True)
+
+    def set_job_list(self, jobs: list):
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        n = len(jobs)
+        self._counts = {"total": n, "done": 0, "processing": 0, "queued": n}
+        for job in jobs:
+            self._make_card(job["company"], job["title"])
+        self._refresh_summary()
+
+    def _make_card(self, company: str, title: str):
+        key = (company, title)
+        card = PipelineJobCard(self._scroll, company=company, title=title)
+        card.pack(fill="x", padx=4, pady=(0, 4))
+        self._cards[key] = card
+        return card
+
+    def mark_processing(self, company: str, title: str, detail: str = "Building resume..."):
+        key = (company, title)
+        if key not in self._cards:
+            self._make_card(company, title)
+            self._counts["total"] += 1
+            self._counts["queued"] += 1
+        self._cards[key].update_status("building", detail=detail)
+        self._counts["queued"]     = max(0, self._counts["queued"] - 1)
+        self._counts["processing"] = self._counts.get("processing", 0) + 1
+        try:
+            self._scroll._parent_canvas.yview_moveto(1.0)
+        except Exception:
+            pass
+        self._refresh_summary()
+
+    def update_ats(self, company: str, title: str, score: int,
+                   iteration: int, max_iter: int, passed: bool, sections: list):
+        key = (company, title)
+        if key not in self._cards:
+            self._make_card(company, title)
+        status = "pass" if passed else "checking"
+        detail = f"ATS iter {iteration}/{max_iter} — score {score}/100"
+        if sections and not passed:
+            detail += f"  |  rebuilding: {', '.join(sections)}"
+        self._cards[key].update_status(status, score=score, detail=detail)
+        self._refresh_summary()
+
+    def mark_done(self, company: str, title: str, score: int,
+                  status: str, sections_rebuilt: list):
+        key = (company, title)
+        if key not in self._cards:
+            self._make_card(company, title)
+        detail = f"Score: {score}/100"
+        if sections_rebuilt:
+            detail += f"  |  rebuilt: {', '.join(sections_rebuilt)}"
+        display = "pass" if status == "done" else status
+        self._cards[key].update_status(display, score=score, detail=detail)
+        self._counts["processing"] = max(0, self._counts["processing"] - 1)
+        self._counts["done"]       = self._counts.get("done", 0) + 1
+        self._refresh_summary()
+
+    def _refresh_summary(self):
+        t = self._counts["total"]
+        d = self._counts["done"]
+        p = self._counts["processing"]
+        q = self._counts["queued"]
+        self._summary.configure(
+            text=f"{t} jobs  |  ✅ {d} done  |  🔨 {p} processing  |  ⏸ {q} queued"
+        )
+
+    def clear(self):
+        for w in self._scroll.winfo_children():
+            w.destroy()
+        self._cards.clear()
+        self._counts = {"total": 0, "done": 0, "processing": 0, "queued": 0}
+        self._summary.configure(text="No jobs queued yet")
+
+
 # ── Status badge ──────────────────────────────────────────────
 class StatusBadge(ctk.CTkLabel):
     COLORS = {
@@ -921,6 +1177,60 @@ class DashboardTab(ctk.CTkFrame):
         parent.grid_columnconfigure(col, weight=1)
 
 
+# ── Screener helpers (used by ScraperTab and ScreenerConfigTab) ───────────
+
+def _build_screener_custom_rules(screener_cfg: dict) -> str:
+    """Return a custom-rules block to append to the screener prompt."""
+    max_years  = int(screener_cfg.get("max_years_exp",   5))
+    yes_pct    = int(screener_cfg.get("yes_match_pct",  70))
+    maybe_pct  = int(screener_cfg.get("maybe_match_pct", 45))
+    levels     = screener_cfg.get("accept_role_levels", ["junior", "mid"])
+    req_sk     = [s.strip() for s in screener_cfg.get("required_skills",  "").splitlines() if s.strip()]
+    pref_sk    = [s.strip() for s in screener_cfg.get("preferred_skills", "").splitlines() if s.strip()]
+    reject_kw  = [s.strip() for s in screener_cfg.get("reject_keywords",  "").splitlines() if s.strip()]
+    accept_kw  = [s.strip() for s in screener_cfg.get("accept_keywords",  "").splitlines() if s.strip()]
+
+    parts = [
+        "\n\n-----------------------------------------------------",
+        "CUSTOM SCREENING RULES (override the defaults above)",
+        "-----------------------------------------------------",
+        f"• Auto-REJECT if JD requires more than {max_years} years of experience.",
+        f"• Verdict thresholds: YES if skills match ≥ {yes_pct}%  |  MAYBE if ≥ {maybe_pct}%  |  NO if below {maybe_pct}%.",
+    ]
+    if levels:
+        non = [l for l in ["junior", "mid", "senior"] if l not in levels]
+        parts.append(f"• Accepted role levels: {', '.join(levels)}.")
+        if non:
+            parts.append(f"• Auto-REJECT (verdict=no) roles clearly labelled: {', '.join(non)}.")
+    if req_sk:
+        parts.append(f"• Required skills — prioritise matching these: {', '.join(req_sk)}.")
+    if pref_sk:
+        parts.append(f"• Preferred skills (bonus): {', '.join(pref_sk)}.")
+    if reject_kw:
+        parts.append(f"• Auto-REJECT immediately if title or JD contains: {', '.join(reject_kw)}.")
+    if accept_kw:
+        parts.append(f"• Boost verdict to YES if job title contains: {', '.join(accept_kw)}.")
+    return "\n".join(parts)
+
+
+def _fuzzy_dedup_jobs(df, threshold: float = 0.90):
+    """Remove near-duplicate jobs (same title+company across sites, ~90% match)."""
+    from difflib import SequenceMatcher
+    seen, keep = [], []
+    for idx, row in df.iterrows():
+        t = str(row.get("title",   "")).lower().strip()
+        c = str(row.get("company", "")).lower().strip()
+        is_dup = any(
+            SequenceMatcher(None, t, st).ratio() >= threshold and
+            SequenceMatcher(None, c, sc).ratio() >= threshold
+            for st, sc in seen
+        )
+        if not is_dup:
+            seen.append((t, c))
+            keep.append(idx)
+    return df.loc[keep].reset_index(drop=True) if keep else df.iloc[0:0]
+
+
 # ══════════════════════════════════════════════════════════════
 #  TAB: Scraper
 # ══════════════════════════════════════════════════════════════
@@ -990,6 +1300,7 @@ class ScraperTab(ctk.CTkFrame):
             ("google",       "Google"),
             ("bayt",         "Bayt"),
             ("bdjobs",       "BDJobs"),
+            ("wellfound",    "Wellfound"),
         ]
         saved_sites = {
             s.strip().lower()
@@ -1051,11 +1362,18 @@ class ScraperTab(ctk.CTkFrame):
         )
         self.stop_btn.pack(padx=15, pady=(10, 0), fill="x")
 
-        ctk.CTkLabel(right, text="Live Output:",
+        ctk.CTkLabel(right, text="Results:",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(padx=15, pady=(10, 2), anchor="w")
 
+        self.results_panel = ScraperResultsPanel(right)
+        self.results_panel.pack(fill="both", expand=True, padx=15, pady=(0, 4))
+
+        ctk.CTkLabel(right, text="Activity Log",
+                     font=ctk.CTkFont(size=10), text_color="#555").pack(padx=15, anchor="w")
+
         self.log_widget = LogWidget(right)
-        self.log_widget.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        self.log_widget.textbox.configure(height=80)
+        self.log_widget.pack(fill="x", padx=15, pady=(2, 15))
 
     def _labeled_entry(self, parent, key, label, value):
         row = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1090,6 +1408,7 @@ class ScraperTab(ctk.CTkFrame):
         self.stop_btn.configure(state="normal")
         self.status.set_status("running", "Scraping...")
         self.log_widget.clear()
+        self.results_panel.clear()
         self._worker = threading.Thread(target=self._scrape_thread, daemon=True)
         self._worker.start()
         self.after(200, self._poll_logs)
@@ -1103,6 +1422,7 @@ class ScraperTab(ctk.CTkFrame):
         try:
             sys.path.insert(0, os.getcwd())
             from jobs_scraper import scrape_all_jobs
+            from db_manager import JobsDB
             import pandas as pd
             import re as _re
 
@@ -1179,8 +1499,62 @@ class ScraperTab(ctk.CTkFrame):
             else:
                 jobs = _pd2.DataFrame()
 
+            if jobs.empty:
+                self.log_queue.put(("log", "WARNING", "No new jobs found to screen."))
+                return
+
+            # ── Load screener config ──────────────────────────────
+            screener_cfg = cfg.get("screener", {})
+
+            # ── Blacklist filter ──────────────────────────────────
+            blacklisted = [c.lower().strip()
+                           for c in screener_cfg.get("blacklisted_companies", []) if c.strip()]
+            if blacklisted:
+                before_bl = len(jobs)
+                jobs = jobs[~jobs["company"].astype(str).str.lower().str.strip().isin(blacklisted)]
+                jobs = jobs.reset_index(drop=True)
+                removed_bl = before_bl - len(jobs)
+                if removed_bl:
+                    self.log_queue.put(("log", "INFO",
+                        f"Blacklist: removed {removed_bl} jobs from {len(blacklisted)} blocked companies."))
+
+            # ── Skip already-applied (from applied.db) ────────────
+            if screener_cfg.get("skip_applied", True):
+                try:
+                    from db_manager import AppliedDB
+                    adf = AppliedDB().get_all()
+                    applied_urls = set(adf["job_url"].dropna().astype(str).tolist())
+                    applied_keys = set(
+                        (str(r["company"]).lower().strip(), str(r["title"]).lower().strip())
+                        for _, r in adf.iterrows()
+                    )
+                    before_ap = len(jobs)
+                    url_col = "job_url" if "job_url" in jobs.columns else "link"
+                    jobs = jobs[~jobs[url_col].astype(str).isin(applied_urls)]
+                    # Also filter by company+title pair
+                    def _not_applied(row):
+                        key = (str(row.get("company","")).lower().strip(),
+                               str(row.get("title","")).lower().strip())
+                        return key not in applied_keys
+                    jobs = jobs[jobs.apply(_not_applied, axis=1)].reset_index(drop=True)
+                    removed_ap = before_ap - len(jobs)
+                    if removed_ap:
+                        self.log_queue.put(("log", "INFO",
+                            f"Skipped {removed_ap} jobs already in applied.db."))
+                except Exception as _ae:
+                    self.log_queue.put(("log", "WARNING", f"Applied DB check failed: {_ae}"))
+
+            # ── Fuzzy cross-site deduplication ────────────────────
+            if screener_cfg.get("fuzzy_dedup", True) and len(jobs) > 1:
+                before_fd = len(jobs)
+                jobs = _fuzzy_dedup_jobs(jobs, threshold=0.90)
+                removed_fd = before_fd - len(jobs)
+                if removed_fd:
+                    self.log_queue.put(("log", "INFO",
+                        f"Fuzzy dedup: removed {removed_fd} near-duplicate jobs across sites."))
+
             self.log_queue.put(("log", "INFO",
-                f"Total: {len(jobs)} new jobs across {len(search_terms)} search term(s). Running AI filter..."))
+                f"{len(jobs)} jobs after filtering. Running AI screener..."))
 
             # ── Load resume text ──────────────────────────────────
             resume_text = ""
@@ -1200,6 +1574,11 @@ class ScraperTab(ctk.CTkFrame):
             profile = load_profile()
             profile_ctx = build_profile_prompt_context(profile)
             prompt_template = prompt_template.replace("{candidate_profile}", profile_ctx)
+
+            # Inject custom screener rules from ScreenerConfigTab
+            custom_rules = _build_screener_custom_rules(screener_cfg)
+            if custom_rules:
+                prompt_template = prompt_template + custom_rules
 
             SCHEMA_SUFFIX = (
                 "\n\nIMPORTANT: Respond with ONLY a JSON object. "
@@ -1275,6 +1654,7 @@ class ScraperTab(ctk.CTkFrame):
 
                 new_row = {
                     "AI_recommendation": s(verdict["verdict"]),
+                    "site":              s(row.get("site", "")),
                     "company":           s(row.get("company",     "")),
                     "title":             s(row.get("title",       "")),
                     "link":              s(job_url),
@@ -1288,6 +1668,12 @@ class ScraperTab(ctk.CTkFrame):
                     "description":       s(row.get("description", "")),
                     "posted_date":       s(row.get("date_posted",  "")),
                 }
+
+                # ── Upsert into jobs.db ───────────────────────────
+                try:
+                    JobsDB().upsert(new_row)
+                except Exception as _dbe:
+                    self.log_queue.put(("log", "WARNING", f"SQLite upsert failed: {_dbe}"))
 
                 # ── Append and save immediately ───────────────────
                 existing_df = pd.concat(
@@ -1313,6 +1699,17 @@ class ScraperTab(ctk.CTkFrame):
                     f"[{v}] {row.get('title','')} @ {row.get('company','')} "
                     f"| {verdict['skills_match_pct']}% "
                     f"| saved ({processed} done, {skipped} skipped)"))
+                _matched = verdict.get("matched_skills", [])
+                _missing = verdict.get("missing_skills", [])
+                self.log_queue.put(("scraper_job", {
+                    "verdict":    verdict["verdict"].lower(),
+                    "company":    str(row.get("company", "")),
+                    "title":      str(row.get("title",   "")),
+                    "skills_pct": int(verdict.get("skills_match_pct", 0)),
+                    "location":   str(row.get("location", "")),
+                    "matched":    _matched[:5] if isinstance(_matched, list) else [],
+                    "missing":    _missing[:5] if isinstance(_missing, list) else [],
+                }, None))
 
             # ── Format Excel once at end ──────────────────────────
             self.log_queue.put(("log", "INFO", "Formatting Excel..."))
@@ -1392,6 +1789,8 @@ class ScraperTab(ctk.CTkFrame):
                 kind, level, msg = self.log_queue.get_nowait()
                 if kind == "log":
                     self.log_widget.append(level, msg)
+                elif kind == "scraper_job":
+                    self.results_panel.add_job(level)  # level holds data dict
                 elif kind == "status":
                     self.status.set_status(level, msg)
                 elif kind == "done":
@@ -1558,11 +1957,18 @@ class PipelineTab(ctk.CTkFrame):
         )
         self.stop_btn.pack(padx=15, pady=(10, 0), fill="x")
 
-        ctk.CTkLabel(right, text="Live Output:",
+        ctk.CTkLabel(right, text="Pipeline Jobs:",
                      font=ctk.CTkFont(size=11), text_color="gray").pack(padx=15, pady=(10, 2), anchor="w")
 
+        self.results_panel = PipelineResultsPanel(right)
+        self.results_panel.pack(fill="both", expand=True, padx=15, pady=(0, 4))
+
+        ctk.CTkLabel(right, text="Activity Log",
+                     font=ctk.CTkFont(size=10), text_color="#555").pack(padx=15, anchor="w")
+
         self.log_widget = LogWidget(right)
-        self.log_widget.pack(fill="both", expand=True, padx=15, pady=(0, 15))
+        self.log_widget.textbox.configure(height=80)
+        self.log_widget.pack(fill="x", padx=15, pady=(2, 15))
 
     def _browse(self, entry, key):
         if "dir" in key or "folder" in key.lower():
@@ -1595,6 +2001,7 @@ class PipelineTab(ctk.CTkFrame):
         self.stop_btn.configure(state="normal")
         self.status.set_status("running", "Processing...")
         self.log_widget.clear()
+        self.results_panel.clear()
 
         q = self.log_queue
         self._worker = threading.Thread(target=self._pipeline_thread, args=(q,), daemon=True)
@@ -1616,7 +2023,7 @@ class PipelineTab(ctk.CTkFrame):
             self._inject_prompts()
 
             from pipeline import main as pipeline_main
-            pipeline_main(stop_event=self.stop_event)
+            pipeline_main(stop_event=self.stop_event, event_queue=q)
 
             q.put(("log", "INFO", "✅ Pipeline complete!"))
             q.put(("status", "done", "Done"))
@@ -1687,6 +2094,8 @@ class PipelineTab(ctk.CTkFrame):
                 kind, level, msg = self.log_queue.get_nowait()
                 if kind == "log":
                     self.log_widget.append(level, msg)
+                elif kind == "pipeline_event":
+                    self._handle_pipeline_event(level, msg)
                 elif kind == "status":
                     self.status.set_status(level, msg)
                 elif kind == "done":
@@ -1700,6 +2109,40 @@ class PipelineTab(ctk.CTkFrame):
                 self._finish_run()
                 return
             self.after(200, self._poll_logs)
+
+    def _handle_pipeline_event(self, event_type: str, data):
+        if not isinstance(data, dict):
+            return
+        company = data.get("company", "")
+        title   = data.get("title",   "")
+
+        if event_type == "job_list":
+            self.results_panel.set_job_list(data.get("jobs", []))
+
+        elif event_type == "job_start":
+            idx   = data.get("index", 1)
+            total = data.get("total", 1)
+            self.results_panel.mark_processing(
+                company, title, detail=f"Building resume... ({idx}/{total})"
+            )
+
+        elif event_type == "ats_score":
+            self.results_panel.update_ats(
+                company, title,
+                score=data.get("score", 0),
+                iteration=data.get("iteration", 1),
+                max_iter=data.get("max_iter", 3),
+                passed=data.get("pass", False),
+                sections=data.get("sections_to_rewrite", []),
+            )
+
+        elif event_type == "job_done":
+            self.results_panel.mark_done(
+                company, title,
+                score=data.get("score", 0),
+                status=data.get("status", "done"),
+                sections_rebuilt=data.get("sections_rebuilt", []),
+            )
 
     def _finish_run(self):
         self.running = False
@@ -1729,7 +2172,6 @@ class PromptsTab(ctk.CTkFrame):
             "experience_section":("💼", "Experience Section", "Generates the Experience LaTeX section"),
             "projects_section":  ("📦", "Projects Section", "Generates the Relevant Projects LaTeX section"),
             "cover_letter":      ("✉", "Cover Letter", "Generates the plain-text cover letter"),
-            "ats_checker":       ("✅", "ATS Checker", "Scores resume against job description"),
         }
 
         scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
@@ -2300,6 +2742,278 @@ class SettingsTab(ctk.CTkFrame):
             messagebox.showerror("Auth Failed", f"Google auth failed:\n{e}\n\nMake sure credentials.json is in project folder.")
 
 # ══════════════════════════════════════════════════════════════
+#  TAB: Screener Config
+# ══════════════════════════════════════════════════════════════
+class ScreenerConfigTab(ctk.CTkFrame):
+    """Visual configurator for the AI job screener — no manual prompt editing needed."""
+
+    _SEC_FG    = "#161b22"
+    _ENTRY_FG  = "#1c2128"
+    _BORDER    = "#30363d"
+
+    def __init__(self, master, config, **kwargs):
+        super().__init__(master, fg_color="transparent", **kwargs)
+        self.config = config
+        self._company_vars: list[str] = []
+        self._build()
+        self._load_values()
+
+    # ── Build ────────────────────────────────────────────────────
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Screener Configuration",
+                     font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 4), anchor="w", padx=30)
+        ctk.CTkLabel(self,
+                     text="Set AI screening rules visually — the prompt is generated automatically.",
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(anchor="w", padx=30, pady=(0, 12))
+
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=30, pady=(0, 8))
+
+        def _section(title):
+            f = ctk.CTkFrame(scroll, fg_color=self._SEC_FG, corner_radius=10)
+            f.pack(fill="x", pady=(0, 12))
+            ctk.CTkLabel(f, text=title, font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color="#58a6ff").pack(anchor="w", padx=16, pady=(10, 6))
+            return f
+
+        def _row(parent):
+            r = ctk.CTkFrame(parent, fg_color="transparent")
+            r.pack(fill="x", padx=16, pady=3)
+            return r
+
+        def _lbl(parent, text, width=240):
+            ctk.CTkLabel(parent, text=text, width=width, anchor="w",
+                         font=ctk.CTkFont(size=12)).pack(side="left")
+
+        # ─── Thresholds ───────────────────────────────────────────
+        thr = _section("Screening Thresholds")
+
+        r = _row(thr)
+        _lbl(r, "Max years experience (auto-reject above):")
+        self._max_years_var = ctk.IntVar(value=5)
+        self._max_years_lbl = ctk.CTkLabel(r, text="5 yrs", width=55, anchor="w",
+                                            font=ctk.CTkFont(size=12, weight="bold"),
+                                            text_color="#79c0ff")
+        ctk.CTkSlider(r, from_=0, to=15, number_of_steps=15,
+                      variable=self._max_years_var, width=200,
+                      command=lambda v: self._max_years_lbl.configure(
+                          text=f"{int(v)} yr{'s' if int(v) != 1 else ''}")
+                      ).pack(side="left", padx=10)
+        self._max_years_lbl.pack(side="left")
+
+        r = _row(thr)
+        _lbl(r, "YES if skills match ≥:")
+        self._yes_pct_var = ctk.IntVar(value=70)
+        self._yes_pct_lbl = ctk.CTkLabel(r, text="70%", width=55, anchor="w",
+                                          font=ctk.CTkFont(size=12, weight="bold"),
+                                          text_color="#3fb950")
+        ctk.CTkSlider(r, from_=30, to=100, number_of_steps=70,
+                      variable=self._yes_pct_var, width=200,
+                      command=lambda v: self._yes_pct_lbl.configure(text=f"{int(v)}%")
+                      ).pack(side="left", padx=10)
+        self._yes_pct_lbl.pack(side="left")
+
+        r = _row(thr)
+        _lbl(r, "MAYBE if skills match ≥:")
+        self._maybe_pct_var = ctk.IntVar(value=45)
+        self._maybe_pct_lbl = ctk.CTkLabel(r, text="45%", width=55, anchor="w",
+                                            font=ctk.CTkFont(size=12, weight="bold"),
+                                            text_color="#d29922")
+        ctk.CTkSlider(r, from_=10, to=80, number_of_steps=70,
+                      variable=self._maybe_pct_var, width=200,
+                      command=lambda v: self._maybe_pct_lbl.configure(text=f"{int(v)}%")
+                      ).pack(side="left", padx=10)
+        self._maybe_pct_lbl.pack(side="left")
+        ctk.CTkLabel(thr, text="  Jobs below the MAYBE threshold become NO.",
+                     font=ctk.CTkFont(size=10), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # ─── Role Levels ──────────────────────────────────────────
+        lvl = _section("Accepted Role Levels")
+        lvl_r = _row(lvl)
+        self._lvl_vars: dict[str, ctk.BooleanVar] = {}
+        for name, default in [("Junior", True), ("Mid", True), ("Senior", False)]:
+            v = ctk.BooleanVar(value=default)
+            self._lvl_vars[name.lower()] = v
+            ctk.CTkCheckBox(lvl_r, text=name, variable=v,
+                            font=ctk.CTkFont(size=12)).pack(side="left", padx=(0, 24))
+        ctk.CTkLabel(lvl, text="  Unchecked levels are auto-rejected before AI screening.",
+                     font=ctk.CTkFont(size=10), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # ─── Skills ───────────────────────────────────────────────
+        sk = _section("Skills")
+        ctk.CTkLabel(sk, text="Required Skills  (one per line — AI will prioritise these):",
+                     font=ctk.CTkFont(size=11), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 4))
+        self._req_box = ctk.CTkTextbox(sk, height=80, fg_color=self._ENTRY_FG,
+                                        border_color=self._BORDER, font=ctk.CTkFont(size=11))
+        self._req_box.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(sk, text="Preferred / Nice-to-have Skills  (one per line):",
+                     font=ctk.CTkFont(size=11), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 4))
+        self._pref_box = ctk.CTkTextbox(sk, height=70, fg_color=self._ENTRY_FG,
+                                         border_color=self._BORDER, font=ctk.CTkFont(size=11))
+        self._pref_box.pack(fill="x", padx=16, pady=(0, 10))
+
+        # ─── Keyword Filters ──────────────────────────────────────
+        kw = _section("Keyword Filters")
+        ctk.CTkLabel(kw, text="Auto-REJECT if job title or description contains  (one per line):",
+                     font=ctk.CTkFont(size=11), text_color="#f85149"
+                     ).pack(anchor="w", padx=16, pady=(0, 4))
+        self._reject_box = ctk.CTkTextbox(kw, height=70, fg_color=self._ENTRY_FG,
+                                           border_color=self._BORDER, font=ctk.CTkFont(size=11))
+        self._reject_box.pack(fill="x", padx=16, pady=(0, 10))
+
+        ctk.CTkLabel(kw, text="Boost to YES if job title contains  (one per line):",
+                     font=ctk.CTkFont(size=11), text_color="#3fb950"
+                     ).pack(anchor="w", padx=16, pady=(0, 4))
+        self._accept_box = ctk.CTkTextbox(kw, height=60, fg_color=self._ENTRY_FG,
+                                           border_color=self._BORDER, font=ctk.CTkFont(size=11))
+        self._accept_box.pack(fill="x", padx=16, pady=(0, 10))
+
+        # ─── Blacklisted Companies ────────────────────────────────
+        bl = _section("Blacklisted Companies")
+        ctk.CTkLabel(bl,
+                     text="Jobs from these companies are silently skipped before AI screening.",
+                     font=ctk.CTkFont(size=11), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        add_r = _row(bl)
+        self._bl_entry = ctk.CTkEntry(add_r, placeholder_text="Company name...",
+                                       fg_color=self._ENTRY_FG, border_color=self._BORDER,
+                                       width=290, font=ctk.CTkFont(size=12))
+        self._bl_entry.pack(side="left", padx=(0, 8))
+        self._bl_entry.bind("<Return>", lambda e: self._add_company())
+        ctk.CTkButton(add_r, text="Add", width=70, height=30,
+                      fg_color="#1f4e79", hover_color="#2563a8",
+                      command=self._add_company).pack(side="left")
+
+        self._bl_frame = ctk.CTkScrollableFrame(bl, fg_color="#0d1117",
+                                                  height=130, corner_radius=6)
+        self._bl_frame.pack(fill="x", padx=16, pady=(8, 12))
+
+        # ─── Deduplication ────────────────────────────────────────
+        dd = _section("Duplicate Detection")
+        r = _row(dd)
+        self._skip_applied_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r, variable=self._skip_applied_var, font=ctk.CTkFont(size=12),
+                        text="Skip jobs already in applied.db (already applied)"
+                        ).pack(side="left")
+        r = _row(dd)
+        self._fuzzy_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(r, variable=self._fuzzy_var, font=ctk.CTkFont(size=12),
+                        text="Skip near-duplicate jobs across sites (90% title + company match)"
+                        ).pack(side="left")
+        ctk.CTkLabel(dd, text="  Deduplication runs before AI screening to save API calls.",
+                     font=ctk.CTkFont(size=10), text_color="#8b949e"
+                     ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        # ─── Save / Reset ─────────────────────────────────────────
+        btn_r = ctk.CTkFrame(scroll, fg_color="transparent")
+        btn_r.pack(fill="x", pady=(4, 20))
+        ctk.CTkButton(btn_r, text="💾 Save Configuration", width=180, height=36,
+                      fg_color="#238636", hover_color="#2ea043",
+                      command=self._save).pack(side="left", padx=(0, 12))
+        ctk.CTkButton(btn_r, text="↩ Reset to Defaults", width=160, height=36,
+                      fg_color="#333", hover_color="#444",
+                      command=self._reset).pack(side="left")
+        self._status_lbl = ctk.CTkLabel(btn_r, text="", font=ctk.CTkFont(size=12))
+        self._status_lbl.pack(side="left", padx=16)
+
+    # ── Load / Save ──────────────────────────────────────────────
+
+    def _load_values(self):
+        cfg = self.config.data.get("screener", {})
+
+        self._max_years_var.set(int(cfg.get("max_years_exp", 5)))
+        self._max_years_lbl.configure(text=f"{int(cfg.get('max_years_exp', 5))} yrs")
+        self._yes_pct_var.set(int(cfg.get("yes_match_pct", 70)))
+        self._yes_pct_lbl.configure(text=f"{int(cfg.get('yes_match_pct', 70))}%")
+        self._maybe_pct_var.set(int(cfg.get("maybe_match_pct", 45)))
+        self._maybe_pct_lbl.configure(text=f"{int(cfg.get('maybe_match_pct', 45))}%")
+
+        accepted = cfg.get("accept_role_levels", ["junior", "mid"])
+        for lvl, var in self._lvl_vars.items():
+            var.set(lvl in accepted)
+
+        self._req_box.delete("1.0", "end")
+        self._req_box.insert("1.0", cfg.get("required_skills", ""))
+        self._pref_box.delete("1.0", "end")
+        self._pref_box.insert("1.0", cfg.get("preferred_skills", ""))
+        self._reject_box.delete("1.0", "end")
+        self._reject_box.insert("1.0", cfg.get("reject_keywords", ""))
+        self._accept_box.delete("1.0", "end")
+        self._accept_box.insert("1.0", cfg.get("accept_keywords", ""))
+
+        self._company_vars = list(cfg.get("blacklisted_companies", []))
+        self._refresh_bl()
+
+        self._skip_applied_var.set(bool(cfg.get("skip_applied", True)))
+        self._fuzzy_var.set(bool(cfg.get("fuzzy_dedup", True)))
+
+    def _save(self):
+        screener = {
+            "max_years_exp":         self._max_years_var.get(),
+            "yes_match_pct":         self._yes_pct_var.get(),
+            "maybe_match_pct":       self._maybe_pct_var.get(),
+            "accept_role_levels":    [l for l, v in self._lvl_vars.items() if v.get()],
+            "required_skills":       self._req_box.get("1.0", "end").strip(),
+            "preferred_skills":      self._pref_box.get("1.0", "end").strip(),
+            "reject_keywords":       self._reject_box.get("1.0", "end").strip(),
+            "accept_keywords":       self._accept_box.get("1.0", "end").strip(),
+            "blacklisted_companies": list(self._company_vars),
+            "skip_applied":          self._skip_applied_var.get(),
+            "fuzzy_dedup":           self._fuzzy_var.get(),
+        }
+        self.config.data["screener"] = screener
+        self.config.save()
+        self._status_lbl.configure(text="✓ Saved", text_color="#3fb950")
+        self.after(2500, lambda: self._status_lbl.configure(text=""))
+
+    def _reset(self):
+        self.config.data.pop("screener", None)
+        self.config.save()
+        self._load_values()
+        self._status_lbl.configure(text="✓ Reset to defaults", text_color="#d29922")
+        self.after(2500, lambda: self._status_lbl.configure(text=""))
+
+    # ── Blacklist CRUD ───────────────────────────────────────────
+
+    def _add_company(self):
+        name = self._bl_entry.get().strip()
+        if not name:
+            return
+        if name.lower() not in [c.lower() for c in self._company_vars]:
+            self._company_vars.append(name)
+            self._refresh_bl()
+        self._bl_entry.delete(0, "end")
+
+    def _remove_company(self, company: str):
+        self._company_vars = [c for c in self._company_vars if c != company]
+        self._refresh_bl()
+
+    def _refresh_bl(self):
+        for w in self._bl_frame.winfo_children():
+            w.destroy()
+        if not self._company_vars:
+            ctk.CTkLabel(self._bl_frame, text="No companies blacklisted.",
+                         font=ctk.CTkFont(size=11), text_color="#8b949e").pack(pady=10)
+            return
+        for co in self._company_vars:
+            r = ctk.CTkFrame(self._bl_frame, fg_color="#1c2128", corner_radius=6)
+            r.pack(fill="x", pady=2)
+            ctk.CTkLabel(r, text=co, font=ctk.CTkFont(size=12),
+                         anchor="w").pack(side="left", padx=10, pady=5)
+            ctk.CTkButton(r, text="✕", width=28, height=24,
+                          fg_color="#3a1010", hover_color="#6a1010",
+                          command=lambda c=co: self._remove_company(c)
+                          ).pack(side="right", padx=6, pady=5)
+
+
+# ══════════════════════════════════════════════════════════════
 #  TAB: Job Tracker
 # ══════════════════════════════════════════════════════════════
 
@@ -2348,6 +3062,10 @@ class JobDetailWindow(ctk.CTkToplevel):
             ctk.CTkButton(action_row, text="View Original Posting ↗", height=36,
                           fg_color="#238636", hover_color="#2ea043", font=ctk.CTkFont(weight="bold"),
                           command=lambda: os.system(f'start {link}')).pack(side="left", padx=(0, 15))
+
+        ctk.CTkButton(action_row, text="Generate Resume & Cover Letter", height=36,
+                      fg_color="#1f6feb", hover_color="#388bfd", font=ctk.CTkFont(weight="bold"),
+                      command=self._generate).pack(side="left", padx=(0, 15))
 
         # Status Badge
         verdict = self.job_data.get("AI_recommendation", "maybe").lower()
@@ -2433,6 +3151,19 @@ class JobDetailWindow(ctk.CTkToplevel):
         reasoning_box.insert("1.0", self.job_data.get("reasoning", "No reasoning provided."))
         reasoning_box.configure(state="disabled")
 
+        # Additional Info
+        add_info_card = ctk.CTkFrame(right_col, fg_color="#161b22", corner_radius=12,
+                                     border_width=1, border_color="#30363d")
+        add_info_card.pack(fill="x", pady=(20, 0))
+
+        ctk.CTkLabel(add_info_card, text="Additional Info",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(padx=20, pady=(15, 10), anchor="w")
+
+        ctk.CTkButton(add_info_card, text="📝  LaTeX Editor & PDF Preview", height=36,
+                      font=ctk.CTkFont(weight="bold"),
+                      fg_color="#6e40c9", hover_color="#8250df",
+                      command=self._open_latex_editor).pack(fill="x", padx=20, pady=(0, 15))
+
     def _add_tag_section(self, parent, title, skills_text, color):
         ctk.CTkLabel(parent, text=title, font=ctk.CTkFont(size=14, weight="bold"), text_color="#8b949e").pack(anchor="w", pady=(20, 5))
 
@@ -2451,13 +3182,948 @@ class JobDetailWindow(ctk.CTkToplevel):
                                 padx=8, pady=2)
             tag.pack(anchor="w", pady=2)
 
+    def _generate(self):
+        SingleJobPipelineDialog(self, self.config, self.job_data)
+
+    def _open_latex_editor(self):
+        LatexEditorDialog(self, self.config, self.job_data)
+
     def _save(self):
         new_verdict = self.verdict_menu.get()
         status = "Applied" if self.applied_var.get() else "Not Applied"
         self.on_save(self.job_data.get("link"), new_verdict, status)
         self.destroy()
 
+
+class SingleJobPipelineDialog(ctk.CTkToplevel):
+    """Runs the resume pipeline for a single job and shows live progress."""
+
+    def __init__(self, master, config, job_data):
+        super().__init__(master)
+        self.title(f"Generate — {job_data.get('title', 'Job')} @ {job_data.get('company', '')}")
+        self.geometry("700x480")
+        self.grab_set()
+        self.config   = config
+        self.job_data = job_data
+        self.running  = False
+
+        self.log_queue = queue.Queue()
+        self._log_handler = QueueLogHandler(self.log_queue)
+        self._log_handler.setFormatter(logging.Formatter("%(name)s — %(message)s"))
+        logging.getLogger().addHandler(self._log_handler)
+
+        self._build()
+        self._start()
+
+    def _build(self):
+        ctk.CTkLabel(self, text="Generate Resume & Cover Letter",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(padx=20, pady=(15, 2), anchor="w")
+        ctk.CTkLabel(self,
+                     text=f"{self.job_data.get('title', '')} at {self.job_data.get('company', '')}",
+                     font=ctk.CTkFont(size=13), text_color="gray").pack(padx=20, pady=(0, 10), anchor="w")
+
+        self.log_widget = LogWidget(self)
+        self.log_widget.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+
+        btn_frame = ctk.CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=(0, 15))
+
+        self.status_lbl = StatusBadge(btn_frame, font=ctk.CTkFont(size=12))
+        self.status_lbl.pack(side="left")
+
+        self.close_btn = ctk.CTkButton(btn_frame, text="Close", width=100,
+                                       fg_color="#333", hover_color="#444",
+                                       command=self._on_close, state="disabled")
+        self.close_btn.pack(side="right")
+
+    def _on_close(self):
+        logging.getLogger().removeHandler(self._log_handler)
+        self.destroy()
+
+    def _inject_prompts(self):
+        try:
+            import agents.resume_builder as rb
+            import re as _re
+            prompts = self.config.get("prompts", default={})
+            roles   = self.config.get("experience_roles", default=None)
+
+            exp_prompt = prompts.get("experience_section", rb.PROMPT_EXPERIENCE)
+            if roles:
+                roles_text = "\n".join([
+                    f"Role {i+1}: {r['title']} @ {r['company']} | {r['dates']}\n"
+                    f"→ {r['total_bullets']} bullets: {r['fabricated_bullets']} fabricated + "
+                    f"{r['real_bullets']} real ({r['domain']} domain)"
+                    for i, r in enumerate(roles)
+                ])
+                exp_prompt = _re.sub(
+                    r'Role 1:.*?(?=\n━━━|\nBULLET RULES|\nRAW LaTeX)',
+                    roles_text, exp_prompt, flags=_re.DOTALL
+                )
+            rb.PROMPT_EXPERIENCE = exp_prompt
+
+            profile = self.config.get("profile", default={})
+            include_proj_links = profile.get("include_project_links", True)
+            proj_prompt = prompts.get("projects_section", rb.PROMPT_PROJECTS)
+            if include_proj_links:
+                proj_prompt = proj_prompt.replace(
+                    "\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}",
+                    "\\href{url}{{\\textbf{Project Name}}} $|$ \\emph{{Tech1, Tech2, Tech3}}"
+                )
+                proj_prompt += "\n\nCRITICAL: For project headings, you MUST use the format: \\resumeProjectHeading{\\href{ACTUAL_URL}{{\\textbf{Project Name}}} $|$ \\emph{Techs}}{{}}. Replace 'ACTUAL_URL' with the real link found in the project data. The second set of braces must be EMPTY."
+            else:
+                proj_prompt = proj_prompt.replace(
+                    "\\href{url}{{\\textbf{Project Name}}} $|$ \\emph{{Tech1, Tech2, Tech3}}",
+                    "\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}"
+                )
+                proj_prompt += "\n\nCRITICAL: For project headings, you MUST use the format: \\resumeProjectHeading{\\textbf{Project Name} $|$ \\emph{Techs}}{{}}. The second set of braces must be EMPTY."
+            rb.PROMPT_PROJECTS = proj_prompt
+
+            rb.PROMPT_SKILLS       = prompts.get("skills_section",  rb.PROMPT_SKILLS)
+            rb.PROMPT_COVER_LETTER = prompts.get("cover_letter",     rb.PROMPT_COVER_LETTER)
+
+        except Exception as e:
+            self.log_queue.put(("log", "WARNING", f"Could not inject prompts: {e}"))
+
+    def _pipeline_thread(self):
+        try:
+            sys.path.insert(0, os.getcwd())
+            self._inject_prompts()
+
+            from pipeline import load_env, collect_ollama_keys, load_text_file, process_job
+            from agents.api_client import RotatingOllamaClient
+            from agents.resume_builder import ResumeBuilderAgent
+            from agents.hiring_agent_ats import HiringAgentATSChecker
+            from utils.latex_compiler import is_pdflatex_available
+
+            load_env(".env")
+
+            app_cfg  = self.config.data
+            pipe_cfg = app_cfg.get("pipeline", {})
+            model    = app_cfg.get("model", {}).get("pipeline", "gemma4:31b-cloud")
+
+            output_dir     = pipe_cfg.get("output_dir",             "outputs")
+            resume_path    = pipe_cfg.get("resume_path",            "resume.txt")
+            projects_path  = pipe_cfg.get("projects_path",          "Projects.txt")
+            max_iterations = int(pipe_cfg.get("max_ats_iterations", 2))
+            pass_threshold = int(pipe_cfg.get("ats_pass_threshold", 85))
+
+            os.environ["RESUME_FILENAME"]       = pipe_cfg.get("resume_filename",       "Resume")
+            os.environ["COVER_LETTER_FILENAME"] = pipe_cfg.get("cover_letter_filename", "Cover_Letter")
+
+            config_keys = app_cfg.get("model", {}).get("api_keys", [])
+            for i, key in enumerate(config_keys, 1):
+                os.environ[f"OLLAMA_API_KEY_{i}"] = key
+
+            api_keys = collect_ollama_keys()
+            client   = RotatingOllamaClient(api_keys=api_keys, model=model)
+
+            existing_resume = load_text_file(resume_path,   "resume")
+            projects_text   = load_text_file(projects_path, "projects")
+
+            builder      = ResumeBuilderAgent(client, projects_text, existing_resume)
+            checker      = HiringAgentATSChecker(client)
+            use_pdflatex = is_pdflatex_available()
+
+            self.log_queue.put(("log", "INFO",
+                f"Starting pipeline for: {self.job_data.get('title')} @ {self.job_data.get('company')}"))
+
+            result = process_job(
+                self.job_data, builder, checker, output_dir, use_pdflatex,
+                use_jd_location=pipe_cfg.get("use_jd_location",   True),
+                default_location=pipe_cfg.get("default_location", "Canada"),
+                max_iterations=max_iterations,
+                pass_threshold=pass_threshold,
+            )
+
+            self.log_queue.put(("log", "INFO",
+                f"✅ Done! ATS Score: {result['score']} | Status: {result['status']}"))
+            if result.get("resume_path"):
+                self.log_queue.put(("log", "INFO", f"Resume → {result['resume_path']}"))
+            if result.get("cover_path"):
+                self.log_queue.put(("log", "INFO", f"Cover Letter → {result['cover_path']}"))
+            self.log_queue.put(("status", "done", f"Done — Score: {result['score']}"))
+
+        except Exception as e:
+            import traceback
+            self.log_queue.put(("log", "ERROR", f"Pipeline failed: {e}"))
+            self.log_queue.put(("log", "ERROR", traceback.format_exc()[:500]))
+            self.log_queue.put(("status", "error", "Failed"))
+
+        self.log_queue.put(("done", None, None))
+
+    def _start(self):
+        self.running = True
+        self.status_lbl.set_status("running", "Generating...")
+        threading.Thread(target=self._pipeline_thread, daemon=True).start()
+        self.after(200, self._poll_logs)
+
+    def _poll_logs(self):
+        while not self.log_queue.empty():
+            try:
+                kind, level, msg = self.log_queue.get_nowait()
+                if kind == "log":
+                    self.log_widget.append(level, msg)
+                elif kind == "status":
+                    self.status_lbl.set_status(level, msg)
+                elif kind == "done":
+                    self.running = False
+                    self.close_btn.configure(state="normal")
+                    return
+            except queue.Empty:
+                break
+        if self.running:
+            self.after(200, self._poll_logs)
+
+
+class LatexEditorDialog(ctk.CTkToplevel):
+    """Side-by-side LaTeX source editor and live PDF preview for a generated resume."""
+
+    def __init__(self, master, config, job_data):
+        super().__init__(master)
+        title   = job_data.get("title",   "Job")
+        company = job_data.get("company", "")
+        self.title(f"LaTeX Editor — {title} @ {company}")
+        self.geometry("1300x780")
+        self.minsize(900, 600)
+
+        self.config          = config
+        self.job_data        = job_data
+        self._pdf_images          = []   # PhotoImage refs — must be kept alive
+        self._compile_thread      = None
+        self._bullet_improvements = {}   # {line_num: (original, improved)}
+        self._overlay_btns        = []   # [(tk.Button, line_num), ...]
+        self._ai_running          = False
+
+        self._build()
+        self._load_tex()
+
+    # ── Path helpers ───────────────────────────────────────────
+    def _slug(self, name: str) -> str:
+        import re
+        name = re.sub(r"[^\w\s-]", "", str(name))
+        name = re.sub(r"\s+", "_", name.strip())
+        return name[:60] or "Unknown"
+
+    def _tex_path(self) -> str:
+        out_dir     = self.config.get("pipeline", "output_dir",      default="outputs")
+        resume_file = self.config.get("pipeline", "resume_filename", default="Resume")
+        return os.path.join(
+            out_dir,
+            self._slug(self.job_data.get("company", "Unknown")),
+            self._slug(self.job_data.get("title",   "Unknown")),
+            f"{resume_file}.tex",
+        )
+
+    def _pdf_path(self) -> str:
+        return self._tex_path().replace(".tex", ".pdf")
+
+    # ── UI ─────────────────────────────────────────────────────
+    def _build(self):
+        # Header bar
+        header = ctk.CTkFrame(self, fg_color="#161b22", corner_radius=0, height=46)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        ctk.CTkLabel(
+            header,
+            text=f"{self.job_data.get('title','')} @ {self.job_data.get('company','')}",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#58a6ff",
+        ).pack(side="left", padx=16)
+        self._path_lbl = ctk.CTkLabel(header, text="", font=ctk.CTkFont(size=10),
+                                      text_color="#484f58")
+        self._path_lbl.pack(side="left", padx=8)
+
+        # PanedWindow for resizable split
+        paned = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashwidth=5,
+                               bg="#21262d", sashrelief="flat", bd=0)
+        paned.pack(fill="both", expand=True)
+
+        # ── Left: editor ──────────────────────────────────────
+        left = tk.Frame(paned, bg="#0d1117")
+
+        ed_bar = tk.Frame(left, bg="#161b22", height=34)
+        ed_bar.pack(fill="x")
+        ed_bar.pack_propagate(False)
+        tk.Label(ed_bar, text="  LaTeX Source", bg="#161b22", fg="#8b949e",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", pady=6)
+
+        # Native tk Text widget gives us line numbers + better performance
+        editor_outer = tk.Frame(left, bg="#0d1117")
+        editor_outer.pack(fill="both", expand=True)
+
+        self._line_canvas = tk.Canvas(editor_outer, width=40, bg="#161b22",
+                                      highlightthickness=0)
+        self._line_canvas.pack(side="left", fill="y")
+
+        self._editor = tk.Text(
+            editor_outer,
+            font=("Consolas", 11),
+            bg="#0d1117", fg="#e6edf3",
+            insertbackground="#e6edf3",
+            selectbackground="#264f78",
+            wrap="none",
+            undo=True,
+            relief="flat",
+            padx=8, pady=4,
+        )
+        ed_scroll_y = tk.Scrollbar(editor_outer, orient="vertical",
+                                   command=self._editor.yview)
+        ed_scroll_x = tk.Scrollbar(left, orient="horizontal",
+                                   command=self._editor.xview)
+        self._ed_scroll_y = ed_scroll_y
+        self._editor.configure(yscrollcommand=self._on_editor_yscroll,
+                               xscrollcommand=ed_scroll_x.set)
+        ed_scroll_y.pack(side="right", fill="y")
+        ed_scroll_x.pack(side="bottom", fill="x")
+        self._editor.pack(side="left", fill="both", expand=True)
+
+        # Tag for highlighting bullet lines that have AI suggestions
+        self._editor.tag_configure(
+            "bullet_hl",
+            background="#142236",
+            foreground="#79c0ff",
+        )
+
+        self._editor.bind("<KeyRelease>", self._update_line_numbers)
+        self._editor.bind("<MouseWheel>", self._update_line_numbers)
+        self._editor.bind("<Configure>", lambda e: self._reposition_overlays())
+
+        # ── Right: preview ────────────────────────────────────
+        right = tk.Frame(paned, bg="#1c2128")
+
+        prev_bar = tk.Frame(right, bg="#161b22", height=34)
+        prev_bar.pack(fill="x")
+        prev_bar.pack_propagate(False)
+        tk.Label(prev_bar, text="  PDF Preview", bg="#161b22", fg="#8b949e",
+                 font=("Segoe UI", 10, "bold")).pack(side="left", pady=6)
+        self._page_lbl = tk.Label(prev_bar, text="", bg="#161b22", fg="#484f58",
+                                  font=("Segoe UI", 9))
+        self._page_lbl.pack(side="right", padx=10)
+
+        preview_outer = tk.Frame(right, bg="#1c2128")
+        preview_outer.pack(fill="both", expand=True)
+
+        self._canvas = tk.Canvas(preview_outer, bg="#1c2128",
+                                 highlightthickness=0, cursor="hand2")
+        prev_scroll = tk.Scrollbar(preview_outer, orient="vertical",
+                                   command=self._canvas.yview)
+        self._canvas.configure(yscrollcommand=prev_scroll.set)
+        prev_scroll.pack(side="right", fill="y")
+        self._canvas.pack(side="left", fill="both", expand=True)
+
+        self._canvas.bind("<MouseWheel>",
+                          lambda e: self._canvas.yview_scroll(
+                              -1 if e.delta > 0 else 1, "units"))
+        self._canvas.bind("<Configure>", self._on_canvas_resize)
+
+        # Add panes
+        paned.add(left,  minsize=380, stretch="always")
+        paned.add(right, minsize=300, stretch="always")
+        paned.paneconfigure(left,  width=680)
+        paned.paneconfigure(right, width=520)
+
+        # ── Bottom toolbar ────────────────────────────────────
+        toolbar = ctk.CTkFrame(self, fg_color="#161b22", height=52, corner_radius=0)
+        toolbar.pack(fill="x", side="bottom")
+        toolbar.pack_propagate(False)
+
+        self._status_lbl = ctk.CTkLabel(
+            toolbar, text="Load or generate a resume, then click Compile.",
+            font=ctk.CTkFont(size=11), text_color="#8b949e",
+        )
+        self._status_lbl.pack(side="left", padx=16)
+
+        ctk.CTkButton(toolbar, text="📂  Open Folder", width=120, height=34,
+                      fg_color="#333", hover_color="#444",
+                      command=self._open_folder).pack(side="right", padx=6, pady=9)
+
+        ctk.CTkButton(toolbar, text="💾  Save .tex", width=110, height=34,
+                      fg_color="#333", hover_color="#444",
+                      command=self._save_tex).pack(side="right", padx=(0, 6), pady=9)
+
+        self._ai_btn = ctk.CTkButton(
+            toolbar, text="🤖  Build with AI", width=150, height=34,
+            fg_color="#6e40c9", hover_color="#8250df",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._build_with_ai,
+        )
+        self._ai_btn.pack(side="right", padx=(0, 6), pady=9)
+
+        self._compile_btn = ctk.CTkButton(
+            toolbar, text="▶  Compile & Preview", width=165, height=34,
+            fg_color="#1f6feb", hover_color="#388bfd",
+            font=ctk.CTkFont(weight="bold"),
+            command=self._start_compile,
+        )
+        self._compile_btn.pack(side="right", padx=(0, 6), pady=9)
+
+    # ── Load / save ────────────────────────────────────────────
+    def _load_tex(self):
+        path = self._tex_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self._editor.delete("1.0", "end")
+            self._editor.insert("1.0", content)
+            self._path_lbl.configure(text=path)
+            self._set_status(f"Loaded: {path}", "ok")
+            self._update_line_numbers()
+            # Auto-render existing PDF if present
+            pdf = self._pdf_path()
+            if os.path.exists(pdf):
+                self._render_pdf(pdf)
+        else:
+            self._path_lbl.configure(text="No .tex file found")
+            self._set_status(
+                "No resume found for this job. Generate one first via 'Generate Resume & Cover Letter'.",
+                "error",
+            )
+
+    def _save_tex(self):
+        path = self._tex_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        content = self._editor.get("1.0", "end-1c")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        self._set_status(f"Saved → {path}", "ok")
+
+    # ── Compile ────────────────────────────────────────────────
+    def _start_compile(self):
+        if self._compile_thread and self._compile_thread.is_alive():
+            return
+        self._compile_btn.configure(state="disabled", text="⏳  Compiling...")
+        self._set_status("Compiling LaTeX…", "info")
+        self._compile_thread = threading.Thread(
+            target=self._compile_worker, daemon=True
+        )
+        self._compile_thread.start()
+
+    def _compile_worker(self):
+        try:
+            from utils.latex_compiler import compile_latex_to_pdf
+
+            content = self._editor.get("1.0", "end-1c")
+            tex     = self._tex_path()
+            pdf     = self._pdf_path()
+            os.makedirs(os.path.dirname(tex), exist_ok=True)
+
+            with open(tex, "w", encoding="utf-8") as f:
+                f.write(content)
+
+            ok = compile_latex_to_pdf(content, pdf)
+
+            if ok and os.path.exists(pdf):
+                self._safe_after(0, lambda: self._render_pdf(pdf))
+                self._safe_after(0, lambda: self._set_status(f"✅ Compiled → {pdf}", "ok"))
+            else:
+                self._safe_after(0, lambda: self._set_status(
+                    "Compilation failed — check LaTeX syntax", "error"))
+        except Exception as exc:
+            msg = str(exc)
+            self._safe_after(0, lambda: self._set_status(f"Error: {msg}", "error"))
+        finally:
+            self._safe_after(0, lambda: self._alive() and self._compile_btn.configure(
+                state="normal", text="▶  Compile & Preview"))
+
+    # ── PDF rendering ──────────────────────────────────────────
+    def _render_pdf(self, pdf_path: str):
+        if not self._alive():
+            return
+        try:
+            import fitz
+            from PIL import Image, ImageTk
+
+            doc   = fitz.open(pdf_path)
+            pages = len(doc)
+            self._canvas.delete("all")
+            self._pdf_images.clear()
+
+            cw     = max(self._canvas.winfo_width(), 400)
+            y_off  = 12
+            margin = 12
+
+            for i in range(pages):
+                page  = doc[i]
+                scale = (cw - margin * 2) / page.rect.width
+                mat   = fitz.Matrix(scale, scale)
+                pix   = page.get_pixmap(matrix=mat, alpha=False)
+
+                img   = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                photo = ImageTk.PhotoImage(img)
+                self._pdf_images.append(photo)
+
+                self._canvas.create_image(cw // 2, y_off, anchor="n", image=photo)
+                y_off += pix.height + margin
+
+            doc.close()
+            self._canvas.configure(scrollregion=(0, 0, cw, y_off + 10))
+            self._canvas.yview_moveto(0)
+            self._page_lbl.configure(text=f"{pages} page{'s' if pages != 1 else ''}")
+
+        except Exception as exc:
+            self._set_status(f"Preview error: {exc}", "error")
+
+    def _on_canvas_resize(self, event):
+        """Re-render PDF at new width when the preview panel is resized."""
+        pdf = self._pdf_path()
+        if self._pdf_images and os.path.exists(pdf):
+            self._render_pdf(pdf)
+
+    # ── Line numbers ───────────────────────────────────────────
+    def _update_line_numbers(self, event=None):
+        if not self._alive():
+            return
+        try:
+            self._line_canvas.delete("all")
+        except Exception:
+            return
+        i    = self._editor.index("@0,0")
+        lc   = self._line_canvas
+        font = ("Consolas", 11)
+        while True:
+            dline = self._editor.dlineinfo(i)
+            if dline is None:
+                break
+            y        = dline[1]
+            h        = dline[3]
+            num      = str(i).split(".")[0]
+            line_int = int(num)
+
+            if line_int in self._bullet_improvements:
+                tag = f"bi_{line_int}"
+                lc.create_text(20, y + h // 2, anchor="center",
+                               text="✨", fill="#8250df",
+                               font=("Segoe UI", 10), tags=(tag,))
+                lc.tag_bind(tag, "<Button-1>",
+                            lambda e, ln=line_int: self._on_bullet_icon_click(ln))
+                lc.tag_bind(tag, "<Enter>",  lambda e: lc.configure(cursor="hand2"))
+                lc.tag_bind(tag, "<Leave>",  lambda e: lc.configure(cursor=""))
+            else:
+                lc.create_text(35, y + 4, anchor="ne", text=num,
+                               fill="#484f58", font=font)
+
+            i = self._editor.index(f"{i}+1line")
+            if self._editor.compare(i, ">=", "end"):
+                break
+
+        self._reposition_overlays()
+
+    # ── Overlay helpers ────────────────────────────────────────
+    def _on_editor_yscroll(self, *args):
+        """Proxy for yscrollcommand — also repositions overlay buttons."""
+        self._ed_scroll_y.set(*args)
+        self._reposition_overlays()
+
+    def _draw_bullet_overlays(self):
+        """Apply text highlights + floating buttons for every bullet with a suggestion."""
+        if not self._alive():
+            return
+        # Destroy stale buttons
+        for btn, _ in self._overlay_btns:
+            try:
+                btn.destroy()
+            except Exception:
+                pass
+        self._overlay_btns.clear()
+
+        # Remove old highlights
+        try:
+            self._editor.tag_remove("bullet_hl", "1.0", "end")
+        except Exception:
+            pass
+
+        for line_num, (original, improved) in self._bullet_improvements.items():
+            try:
+                self._editor.tag_add("bullet_hl", f"{line_num}.0", f"{line_num}.end+1c")
+            except Exception:
+                pass
+
+            btn = tk.Button(
+                self._editor,
+                text="✨ Improve",
+                bg="#6e40c9", fg="white",
+                activebackground="#8250df", activeforeground="white",
+                relief="flat", bd=0, cursor="hand2",
+                font=("Segoe UI", 8, "bold"),
+                padx=6, pady=1,
+                command=lambda ln=line_num: self._on_bullet_icon_click(ln),
+            )
+            self._overlay_btns.append((btn, line_num))
+
+        self._reposition_overlays()
+        self._update_line_numbers()
+
+    def _reposition_overlays(self):
+        """Move each overlay button to the current pixel Y of its bullet line."""
+        if not self._alive():
+            return
+        for btn, line_num in self._overlay_btns:
+            try:
+                dline = self._editor.dlineinfo(f"{line_num}.0")
+                if dline:
+                    _, y, _, h, _ = dline
+                    btn_h = 18
+                    btn.place(relx=1.0, x=-90, y=y + max(0, (h - btn_h) // 2),
+                              width=82, height=btn_h)
+                else:
+                    btn.place_forget()
+            except Exception:
+                pass
+
+    # ── Helpers ────────────────────────────────────────────────
+    def _alive(self) -> bool:
+        """Return True if the dialog window still exists in tk."""
+        try:
+            return bool(self.winfo_exists())
+        except Exception:
+            return False
+
+    def _safe_after(self, ms: int, func) -> None:
+        """Schedule func on the main thread; silently drop if window is gone."""
+        try:
+            self.after(ms, func)
+        except Exception:
+            pass
+
+    def _set_status(self, msg: str, kind: str = "info"):
+        if not self._alive():
+            return
+        colors = {"ok": "#3fb950", "error": "#f85149", "info": "#FFC107"}
+        try:
+            self._status_lbl.configure(text=msg, text_color=colors.get(kind, "#8b949e"))
+        except Exception:
+            pass
+
+    def _open_folder(self):
+        folder = os.path.dirname(self._tex_path())
+        if os.path.exists(folder):
+            os.startfile(folder)
+        else:
+            self._set_status("Output folder not found — generate a resume first.", "error")
+
+    # ── Build with AI ──────────────────────────────────────────
+    def _build_with_ai(self):
+        tex = self._tex_path()
+        if not os.path.exists(tex):
+            self._set_status("No resume found — generating first…", "info")
+            self._ai_btn.configure(state="disabled", text="⏳  Generating…")
+            threading.Thread(target=self._generate_then_analyze, daemon=True).start()
+        else:
+            if not self._editor.get("1.0", "end-1c").strip():
+                self._load_tex()
+            self._start_ai_analysis()
+
+    def _inject_prompts(self):
+        try:
+            import agents.resume_builder as rb
+            import re as _re
+            prompts = self.config.get("prompts", default={})
+            roles   = self.config.get("experience_roles", default=None)
+            exp_prompt = prompts.get("experience_section", rb.PROMPT_EXPERIENCE)
+            if roles:
+                roles_text = "\n".join([
+                    f"Role {i+1}: {r['title']} @ {r['company']} | {r['dates']}\n"
+                    f"→ {r['total_bullets']} bullets: {r['fabricated_bullets']} fabricated + "
+                    f"{r['real_bullets']} real ({r['domain']} domain)"
+                    for i, r in enumerate(roles)
+                ])
+                exp_prompt = _re.sub(
+                    r'Role 1:.*?(?=\n━━━|\nBULLET RULES|\nRAW LaTeX)',
+                    roles_text, exp_prompt, flags=_re.DOTALL
+                )
+            rb.PROMPT_EXPERIENCE = exp_prompt
+            profile = self.config.get("profile", default={})
+            proj_prompt = prompts.get("projects_section", rb.PROMPT_PROJECTS)
+            if profile.get("include_project_links", True):
+                proj_prompt = proj_prompt.replace(
+                    "\\textbf{{Project Name}} $|$ \\emph{{Tech1, Tech2, Tech3}}",
+                    "\\href{url}{{\\textbf{Project Name}}} $|$ \\emph{{Tech1, Tech2, Tech3}}"
+                )
+                proj_prompt += "\n\nCRITICAL: Use \\resumeProjectHeading{\\href{ACTUAL_URL}{{\\textbf{Name}}} $|$ \\emph{Techs}}{{}}."
+            rb.PROMPT_PROJECTS    = proj_prompt
+            rb.PROMPT_SKILLS       = prompts.get("skills_section",  rb.PROMPT_SKILLS)
+            rb.PROMPT_COVER_LETTER = prompts.get("cover_letter",     rb.PROMPT_COVER_LETTER)
+        except Exception:
+            pass
+
+    def _generate_then_analyze(self):
+        """Run the pipeline for this job (no .tex found), then start AI analysis."""
+        try:
+            self._inject_prompts()
+            from pipeline import load_env, collect_ollama_keys, load_text_file, process_job
+            from agents.api_client import RotatingOllamaClient
+            from agents.resume_builder import ResumeBuilderAgent
+            from agents.hiring_agent_ats import HiringAgentATSChecker
+            from utils.latex_compiler import is_pdflatex_available
+
+            load_env(".env")
+            app_cfg  = self.config.data
+            pipe_cfg = app_cfg.get("pipeline", {})
+            model    = app_cfg.get("model", {}).get("pipeline", "gemma4:31b-cloud")
+            os.environ["RESUME_FILENAME"]       = pipe_cfg.get("resume_filename",       "Resume")
+            os.environ["COVER_LETTER_FILENAME"] = pipe_cfg.get("cover_letter_filename", "Cover_Letter")
+            for i, key in enumerate(app_cfg.get("model", {}).get("api_keys", []), 1):
+                os.environ[f"OLLAMA_API_KEY_{i}"] = key
+
+            client   = RotatingOllamaClient(api_keys=collect_ollama_keys(), model=model)
+            builder  = ResumeBuilderAgent(
+                client,
+                load_text_file(pipe_cfg.get("projects_path", "Projects.txt"), "projects"),
+                load_text_file(pipe_cfg.get("resume_path",   "resume.txt"),   "resume"),
+            )
+            checker  = HiringAgentATSChecker(client)
+
+            self._safe_after(0, lambda: self._set_status("Generating resume…", "info"))
+            result = process_job(
+                self.job_data, builder, checker,
+                pipe_cfg.get("output_dir", "outputs"),
+                is_pdflatex_available(),
+                use_jd_location=pipe_cfg.get("use_jd_location",   True),
+                default_location=pipe_cfg.get("default_location", "Canada"),
+                max_iterations=int(pipe_cfg.get("max_ats_iterations", 2)),
+                pass_threshold=int(pipe_cfg.get("ats_pass_threshold", 85)),
+            )
+            if result.get("status") != "failed":
+                self._safe_after(0, self._load_tex)
+                self._safe_after(300, self._start_ai_analysis)
+            else:
+                self._safe_after(0, lambda: self._set_status("Resume generation failed.", "error"))
+        except Exception as exc:
+            msg = str(exc)
+            self._safe_after(0, lambda: self._set_status(f"Generation failed: {msg}", "error"))
+        finally:
+            self._safe_after(0, lambda: self._alive() and self._ai_btn.configure(
+                state="normal", text="🤖  Build with AI"))
+
+    def _start_ai_analysis(self):
+        if self._ai_running:
+            return
+        self._clear_overlays()
+        self._ai_running = True
+        self._ai_btn.configure(state="disabled", text="🤖  Analyzing…")
+        self._set_status("AI is reading bullet points…", "info")
+        threading.Thread(target=self._analyze_bullets_thread, daemon=True).start()
+
+    def _analyze_bullets_thread(self):
+        try:
+            import re
+            from ai import OllamaAssistant, send_with_retries
+
+            bullet_map = self._parse_bullet_positions()
+            if not bullet_map:
+                self._safe_after(0, lambda: self._set_status(
+                    "No \\resumeItem bullets found in this resume.", "info"))
+                return
+
+            total   = len(bullet_map)
+            app_cfg = self.config.data
+            model   = app_cfg.get("model", {}).get("pipeline", "gemma4:31b-cloud")
+            keys    = app_cfg.get("model", {}).get("api_keys", [""])
+            if not keys:
+                keys = [""]
+
+            self._safe_after(0, lambda: self._set_status(
+                f"Analyzing {total} bullet points — this may take a minute…", "info"))
+
+            for idx, (line_num, original) in enumerate(bullet_map.items(), 1):
+                if not self._alive():
+                    break           # window closed — stop processing
+                os.environ["OLLAMA_API_KEY"] = keys[(idx - 1) % len(keys)]
+                try:
+                    improved = send_with_retries(
+                        OllamaAssistant(model=model),
+                        self._build_improvement_prompt(original),
+                    ).strip()
+                    # Strip any \resumeItem{} wrapper the AI may have added
+                    improved = re.sub(r'^\\resumeItem\{', '', improved)
+                    if improved.endswith("}"):
+                        improved = improved[:-1]
+                    improved = improved.strip()
+                    if improved and improved != original:
+                        self._bullet_improvements[line_num] = (original, improved)
+                        self._safe_after(0, self._draw_bullet_overlays)
+                except Exception:
+                    pass
+                n = idx
+                self._safe_after(0, lambda n=n, t=total: self._set_status(
+                    f"Analyzed {n}/{t} bullets…", "info"))
+
+            count = len(self._bullet_improvements)
+            self._safe_after(0, lambda: self._set_status(
+                f"✅ {count} suggestions ready — click ✨ in the gutter to review each bullet.",
+                "ok"))
+        except Exception as exc:
+            msg = str(exc)
+            self._safe_after(0, lambda: self._set_status(f"AI analysis failed: {msg}", "error"))
+        finally:
+            self._ai_running = False
+            self._safe_after(0, lambda: self._alive() and self._ai_btn.configure(
+                state="normal", text="🤖  Build with AI"))
+
+    def _build_improvement_prompt(self, bullet_text: str) -> str:
+        title       = self.job_data.get("title",       "Software Developer")
+        company     = self.job_data.get("company",     "")
+        description = str(self.job_data.get("description", ""))[:2000]
+        return (
+            "You are an expert resume writer. Improve the following single resume bullet point.\n\n"
+            f"JOB TITLE: {title}\nCOMPANY: {company}\n"
+            f"JOB DESCRIPTION (excerpt):\n{description}\n\n"
+            f"CURRENT BULLET CONTENT:\n{bullet_text}\n\n"
+            "RULES:\n"
+            "- Stronger action verbs (Architected, Engineered, Delivered, Optimized)\n"
+            "- Add or sharpen specific metrics (%, count, time saved, scale)\n"
+            "- Weave in relevant JD keywords naturally\n"
+            "- Preserve LaTeX formatting like \\textbf{} for 2-3 key terms\n"
+            "- All % → \\%, all & → \\&\n"
+            "- Output ONLY the improved bullet content (NOT the \\resumeItem{} wrapper)\n"
+            "- Keep to 2 compiled lines maximum\n\n"
+            "IMPROVED BULLET CONTENT:"
+        )
+
+    def _parse_bullet_positions(self) -> dict:
+        """Return {line_num: bullet_content} for every \\resumeItem in the editor."""
+        content = self._editor.get("1.0", "end-1c")
+        results = {}
+        i       = 0
+        marker  = r"\resumeItem{"
+        while True:
+            idx = content.find(marker, i)
+            if idx == -1:
+                break
+            line_num = content[:idx].count("\n") + 1
+            start    = idx + len(marker)
+            depth    = 1
+            j        = start
+            while j < len(content) and depth > 0:
+                if   content[j] == "{": depth += 1
+                elif content[j] == "}": depth -= 1
+                j += 1
+            results[line_num] = content[start:j - 1].strip()
+            i = j
+        return results
+
+    def _on_bullet_icon_click(self, line_num: int):
+        if line_num not in self._bullet_improvements:
+            return
+        original, improved = self._bullet_improvements[line_num]
+        BulletSuggestionDialog(
+            self, original, improved,
+            on_apply=lambda new: self._apply_bullet(line_num, new),
+        )
+
+    def _apply_bullet(self, line_num: int, new_content: str):
+        """Replace the content inside \\resumeItem{} at line_num with new_content."""
+        content = self._editor.get("1.0", "end-1c")
+        marker  = r"\resumeItem{"
+        lines   = content.split("\n")
+        # Character offset to the start of target line (0-indexed)
+        char_offset = sum(len(l) + 1 for l in lines[:line_num - 1])
+        idx = content.find(marker, char_offset)
+        if idx == -1:
+            return
+        start = idx + len(marker)
+        depth = 1
+        j     = start
+        while j < len(content) and depth > 0:
+            if   content[j] == "{": depth += 1
+            elif content[j] == "}": depth -= 1
+            j += 1
+        new_full = content[:start] + new_content + content[j - 1:]
+        self._editor.delete("1.0", "end")
+        self._editor.insert("1.0", new_full)
+        self._bullet_improvements.pop(line_num, None)
+        self._draw_bullet_overlays()
+        self._save_tex()
+        self._start_compile()
+
+    def _clear_overlays(self):
+        self._bullet_improvements.clear()
+        for btn, _ in self._overlay_btns:
+            try:
+                btn.destroy()
+            except Exception:
+                pass
+        self._overlay_btns.clear()
+        try:
+            self._editor.tag_remove("bullet_hl", "1.0", "end")
+        except Exception:
+            pass
+        self._update_line_numbers()
+
+
+class BulletSuggestionDialog(ctk.CTkToplevel):
+    """Side-by-side comparison of current vs AI-improved bullet point."""
+
+    def __init__(self, master, original: str, improved: str, on_apply):
+        super().__init__(master)
+        self.title("Improve Bullet Point")
+        self.geometry("940x430")
+        self.resizable(True, False)
+        self.grab_set()
+        self._improved = improved
+        self._on_apply = on_apply
+        self._build(original, improved)
+
+    def _build(self, original: str, improved: str):
+        ctk.CTkLabel(self, text="Choose which version to use in your resume",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(
+                     padx=24, pady=(16, 12), anchor="w")
+
+        grid = ctk.CTkFrame(self, fg_color="transparent")
+        grid.pack(fill="both", expand=True, padx=24, pady=(0, 20))
+        grid.grid_columnconfigure(0, weight=1)
+        grid.grid_columnconfigure(1, weight=1)
+
+        # ── Current ─────────────────────────────────────────────
+        orig = ctk.CTkFrame(grid, fg_color="#161b22", corner_radius=10,
+                             border_width=1, border_color="#30363d")
+        orig.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+
+        ctk.CTkLabel(orig, text="  Current Version",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#8b949e", anchor="w").pack(fill="x", padx=4, pady=(12, 4))
+
+        ob = ctk.CTkTextbox(orig, height=240, wrap="word",
+                            font=ctk.CTkFont(family="Consolas", size=11),
+                            fg_color="#0d1117", border_width=0, corner_radius=0)
+        ob.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        ob.insert("1.0", original)
+        ob.configure(state="disabled")
+
+        ctk.CTkButton(orig, text="Keep Original", height=36,
+                      fg_color="#30363d", hover_color="#444",
+                      command=self.destroy).pack(fill="x", padx=12, pady=(0, 14))
+
+        # ── AI Improved ─────────────────────────────────────────
+        impr = ctk.CTkFrame(grid, fg_color="#0d1f3c", corner_radius=10,
+                             border_width=1, border_color="#1f6feb")
+        impr.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+
+        hdr = ctk.CTkFrame(impr, fg_color="transparent")
+        hdr.pack(fill="x", padx=12, pady=(12, 4))
+        ctk.CTkLabel(hdr, text="✨  AI Improved",
+                     font=ctk.CTkFont(size=12, weight="bold"),
+                     text_color="#58a6ff").pack(side="left")
+
+        ib = ctk.CTkTextbox(impr, height=240, wrap="word",
+                            font=ctk.CTkFont(family="Consolas", size=11),
+                            fg_color="#0d1117", border_width=0, corner_radius=0)
+        ib.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        ib.insert("1.0", improved)
+        ib.configure(state="disabled")
+
+        ctk.CTkButton(impr, text="✅  Use AI Version", height=36,
+                      fg_color="#1f6feb", hover_color="#388bfd",
+                      font=ctk.CTkFont(weight="bold"),
+                      command=self._use_improved).pack(fill="x", padx=12, pady=(0, 14))
+
+    def _use_improved(self):
+        self._on_apply(self._improved)
+        self.destroy()
+
+
 class AddJobDialog(ctk.CTkToplevel):
+    """Dialog to manually add a job posting. Supports URL fetch, LinkedIn guest API, and manual paste."""
     """Dialog to manually add a job posting. Supports URL fetch, LinkedIn guest API, and manual paste."""
 
     # Keywords that indicate a login/auth wall was returned instead of the job
@@ -2983,9 +4649,9 @@ class JobTrackerTab(ctk.CTkFrame):
     def __init__(self, master, config, **kwargs):
         super().__init__(master, fg_color="transparent", **kwargs)
         self.config = config
-        self._df = None   # cached DataFrame
-        self._page = 0    # current page index
-        # Pre-create fonts once per class
+        self._df      = None
+        self._page    = 0
+        self._loading = False
         if JobTrackerTab._font_site is None:
             JobTrackerTab._font_site    = ctk.CTkFont(size=10)
             JobTrackerTab._font_company = ctk.CTkFont(size=11, weight="bold")
@@ -3013,6 +4679,9 @@ class JobTrackerTab(ctk.CTkFrame):
                                                   command=self._refresh_list, height=28)
         self.filter_menu.pack(side="left")
 
+        ctk.CTkButton(top_bar, text="🗑 Remove All", width=100, height=28,
+                      fg_color="#5a1a1a", hover_color="#7a1a1a",
+                      command=self._remove_all).pack(side="right", padx=5)
         ctk.CTkButton(top_bar, text="🗑 Clear NOs", width=100, height=28,
                       fg_color="#442222", hover_color="#662222",
                       command=self._remove_nos).pack(side="right", padx=5)
@@ -3077,15 +4746,40 @@ class JobTrackerTab(ctk.CTkFrame):
         self._refresh_list()
 
     def _load_df(self):
+        from db_manager import JobsDB
         excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
-        if not os.path.exists(excel_path):
+        db = JobsDB()
+        if db.count() == 0 and os.path.exists(excel_path):
+            db.import_from_excel(excel_path)
+        df = db.get_all()
+        if df.empty:
             self._df = None
             return
-        self._df = pd.read_excel(excel_path)
+        if "ai_recommendation" in df.columns:
+            df = df.rename(columns={"ai_recommendation": "AI_recommendation"})
+        self._df = df.drop(columns=["id", "created_at"], errors="ignore")
 
     def _refresh_list(self, *args, reload=False):
         if reload or self._df is None:
-            self._load_df()
+            self._loading = True
+            self._draw_loading()
+            threading.Thread(target=self._load_df_bg, daemon=True).start()
+        else:
+            self._page = 0
+            self._draw_page()
+
+    def _draw_loading(self):
+        for w in self.list_frame.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(self.list_frame, text="Loading jobs...",
+                     font=ctk.CTkFont(size=13), text_color="#8b949e").pack(pady=30)
+
+    def _load_df_bg(self):
+        self._load_df()
+        self.after(0, self._on_df_ready)
+
+    def _on_df_ready(self):
+        self._loading = False
         self._page = 0
         self._draw_page()
 
@@ -3316,6 +5010,7 @@ class JobTrackerTab(ctk.CTkFrame):
 
     def _update_application_status(self, job_link):
         if not job_link: return
+        from db_manager import JobsDB
         excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
         try:
             df = pd.read_excel(excel_path)
@@ -3323,15 +5018,19 @@ class JobTrackerTab(ctk.CTkFrame):
             if "application_status" not in df.columns:
                 df["application_status"] = "Not Applied"
             else:
-                # Ensure the column is object/string type to avoid dtype errors when setting 'Applied'
                 df["application_status"] = df["application_status"].astype(str)
 
             current_status = df.loc[df["link"] == job_link, "application_status"].values
-            # Toggle status
             new_status = "Applied" if len(current_status) == 0 or current_status[0] != "Applied" else "Not Applied"
 
             df.loc[df["link"] == job_link, "application_status"] = new_status
             df.to_excel(excel_path, index=False)
+
+            # Sync to SQLite
+            try:
+                JobsDB().set_application_status(str(job_link), new_status)
+            except Exception as _dbe:
+                logging.warning("SQLite status sync failed: %s", _dbe)
 
             if new_status == "Applied":
                 if self._migrate_to_applied(job_link):
@@ -3339,12 +5038,13 @@ class JobTrackerTab(ctk.CTkFrame):
                 else:
                     messagebox.showwarning("Partial Success", "Updated status, but could not migrate files/record.")
 
-            self._df = None  # invalidate cache after write
+            self._df = None
             self._refresh_list(reload=True)
         except Exception as e:
             messagebox.showerror("Error", f"Could not update application status: {e}")
 
     def _update_verdict(self, job_link, new_verdict, status="Not Applied"):
+        from db_manager import JobsDB
         excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
         try:
             df = pd.read_excel(excel_path)
@@ -3359,6 +5059,14 @@ class JobTrackerTab(ctk.CTkFrame):
             df.loc[df["link"] == job_link, "application_status"] = status
             df.to_excel(excel_path, index=False)
 
+            # Sync to SQLite
+            try:
+                db = JobsDB()
+                db.set_verdict(str(job_link), new_verdict)
+                db.set_application_status(str(job_link), status)
+            except Exception as _dbe:
+                logging.warning("SQLite verdict sync failed: %s", _dbe)
+
             if status == "Applied":
                 self._migrate_to_applied(job_link)
 
@@ -3368,35 +5076,53 @@ class JobTrackerTab(ctk.CTkFrame):
             messagebox.showerror("Save Error", f"Could not update record: {e}")
 
     def _remove_nos(self):
+        from db_manager import JobsDB
         excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
-        if not os.path.exists(excel_path): return
+        db = JobsDB()
+        if db.count() == 0 and os.path.exists(excel_path):
+            db.import_from_excel(excel_path)
         try:
-            df = pd.read_excel(excel_path)
-            original_count = len(df)
-            df = df[df["AI_recommendation"].str.lower() != "no"]
-            df.to_excel(excel_path, index=False)
-            messagebox.showinfo("Cleaned", f"Removed {original_count - len(df)} records with 'No' verdict.")
+            before = db.count()
+            db.delete_by_verdict("no")
+            removed = before - db.count()
+            db.sync_to_excel(excel_path)
+            messagebox.showinfo("Cleaned", f"Removed {removed} 'No' verdict records.")
             self._df = None
             self._refresh_list(reload=True)
         except Exception as e:
             messagebox.showerror("Error", f"Could not remove NOs: {e}")
 
     def _remove_not_applied(self):
+        from db_manager import JobsDB
         excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
-        if not os.path.exists(excel_path): return
+        db = JobsDB()
+        if db.count() == 0 and os.path.exists(excel_path):
+            db.import_from_excel(excel_path)
         try:
-            df = pd.read_excel(excel_path)
-            if "application_status" not in df.columns:
-                df["application_status"] = "Not Applied"
-
-            original_count = len(df)
-            df = df[df["application_status"] != "Not Applied"]
-            df.to_excel(excel_path, index=False)
-            messagebox.showinfo("Cleaned", f"Removed {original_count - len(df)} records not yet applied.")
+            before = db.count()
+            db.delete_not_applied()
+            removed = before - db.count()
+            db.sync_to_excel(excel_path)
+            messagebox.showinfo("Cleaned", f"Removed {removed} not-applied records.")
             self._df = None
             self._refresh_list(reload=True)
         except Exception as e:
             messagebox.showerror("Error", f"Could not remove Not Applied: {e}")
+
+    def _remove_all(self):
+        from db_manager import JobsDB
+        if not messagebox.askyesno("Remove All",
+                                   "Remove ALL jobs from the tracker?\nThis cannot be undone."):
+            return
+        excel_path = self.config.get("pipeline", "excel_path", default="jobs.xlsx")
+        db = JobsDB()
+        try:
+            db.delete_all()
+            db.sync_to_excel(excel_path)
+            self._df = None
+            self._refresh_list(reload=True)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not remove all: {e}")
 
 # ══════════════════════════════════════════════════════════════
 #  TAB: Applied
@@ -3428,7 +5154,7 @@ class AppliedTab(ctk.CTkFrame):
         ctk.CTkLabel(self, text="Applied Jobs",
                      font=ctk.CTkFont(size=22, weight="bold")).pack(pady=(20, 4), anchor="w", padx=30)
 
-        applied_path = self.config.get("pipeline", "applied_excel_path", default="Job-Tracker.xlsx")
+        applied_path = self.config.get("pipeline", "applied_db_path", default="applied.db")
         self._file_label = ctk.CTkLabel(
             self,
             text=f"Reading from: {applied_path}",
@@ -3455,15 +5181,15 @@ class AppliedTab(ctk.CTkFrame):
                                           text_color="#8b949e")
         self._count_label.pack(side="right", padx=10)
 
-        # Column definitions
+        # Column definitions — now driven by SQLite applied_jobs table
         self._col_defs = [
-            ("Company",       150, "w"),
-            ("Position",      185, "w"),
-            ("Location",      120, "w"),
-            ("Site",           90, "w"),
-            ("Match %",        65, "w"),
-            ("Verdict",        80, "w"),
-            ("Applied Date",  110, "w"),
+            ("Company",      140, "w"),
+            ("Position",     175, "w"),
+            ("Location",     110, "w"),
+            ("Applied",       95, "w"),
+            ("Score",         65, "w"),
+            ("Status",        75, "w"),
+            ("Actions",      225, "w"),
         ]
 
         header_frame = ctk.CTkFrame(self, fg_color="#161b22", height=45, corner_radius=8)
@@ -3498,18 +5224,16 @@ class AppliedTab(ctk.CTkFrame):
         self._load()
 
     def _load(self, reload=False):
-        applied_excel = self.config.get("pipeline", "applied_excel_path", default="Job-Tracker.xlsx")
-        self._file_label.configure(text=f"Reading from: {applied_excel}")
-        if not os.path.exists(applied_excel):
+        from db_manager import AppliedDB
+        applied_db_path = self.config.get("pipeline", "applied_db_path", default="applied.db")
+        self._file_label.configure(text=f"Reading from: {applied_db_path}")
+        try:
+            adb = AppliedDB(applied_db_path)
+            df = adb.get_all()
+            self._df = df if not df.empty else None
+        except Exception as e:
             self._df = None
-            logging.warning("Applied Excel not found: %s", applied_excel)
-        else:
-            try:
-                self._df = pd.read_excel(applied_excel)
-            except Exception as e:
-                self._df = None
-                logging.warning("Could not load applied Excel: %s", e)
-        # Clear search then draw (set triggers trace but _filter is idempotent)
+            logging.warning("Could not load applied.db: %s", e)
         self._search_var.set("")
         self._filter()
 
@@ -3520,13 +5244,13 @@ class AppliedTab(ctk.CTkFrame):
         elif not query:
             self._filtered_df = self._df
         else:
-            search_cols = ["company", "title", "location", "site", "reasoning", "matched_skills"]
+            search_cols = ["company", "title", "location", "status", "job_url"]
             mask = pd.Series([False] * len(self._df), index=self._df.index)
             for col in search_cols:
                 if col in self._df.columns:
                     mask = mask | self._df[col].astype(str).str.lower().str.contains(query, na=False)
             self._filtered_df = self._df[mask]
-        self._page = 0   # reset to first page whenever the filter changes
+        self._page = 0
         self._render_rows()
 
     def _prev_page(self):
@@ -3546,10 +5270,9 @@ class AppliedTab(ctk.CTkFrame):
             self._page_label.configure(text="Page 1 of 1  (0 jobs)")
             self._btn_prev.configure(state="disabled")
             self._btn_next.configure(state="disabled")
-            applied_excel = self.config.get("pipeline", "applied_excel_path", default="Job-Tracker.xlsx")
             ctk.CTkLabel(self.list_frame,
-                         text=f"File not found:\n{applied_excel}\n\nCheck the Applied Excel path in the Pipeline tab.",
-                         justify="center", text_color="#da3633").pack(pady=40)
+                         text="No applied jobs in database yet.\nResumes generated by the pipeline will appear here.",
+                         justify="center", text_color="#8b949e").pack(pady=40)
             return
 
         total = len(self._filtered_df)
@@ -3560,7 +5283,7 @@ class AppliedTab(ctk.CTkFrame):
             self._btn_next.configure(state="disabled")
             ctk.CTkLabel(self.list_frame,
                          text="No jobs match your search." if self._search_var.get().strip()
-                              else "No applied jobs found.\nUse the Job Tracker tab and mark jobs as Applied.",
+                              else "No applied jobs found.",
                          justify="center", text_color="#8b949e").pack(pady=40)
             return
 
@@ -3580,62 +5303,170 @@ class AppliedTab(ctk.CTkFrame):
 
     def _add_row(self, row):
         PAD = (6, 0)
-        verdict = str(row.get("AI_recommendation", "")).lower()
-        v_color = "#238636" if verdict == "yes" else "#d29922" if verdict == "maybe" else "#da3633"
+        job_id  = int(row.get("id", 0))
+        company = str(row.get("company", "Unknown"))
+        title   = str(row.get("title",   "Unknown"))
+
+        status_raw = str(row.get("status", "")).lower()
+        status_color = (
+            "#3fb950" if status_raw == "done"
+            else "#58a6ff" if status_raw == "tex_only"
+            else "#d29922"
+        )
 
         row_frame = ctk.CTkFrame(self.list_frame, fg_color="#1c2128", height=46, corner_radius=6)
         row_frame.pack(fill="x", pady=2)
         row_frame.pack_propagate(False)
 
-        company = str(row.get("company", "Unknown"))[:22]
-        c_lbl = ctk.CTkLabel(row_frame, text=company, width=150, anchor="w",
+        # Company
+        c_lbl = ctk.CTkLabel(row_frame, text=company[:20], width=140, anchor="w",
                               font=self._font_company)
         c_lbl.pack(side="left", padx=PAD, pady=8)
 
-        title = str(row.get("title", "Unknown"))[:28]
-        t_lbl = ctk.CTkLabel(row_frame, text=title, width=185, anchor="w",
+        # Title
+        t_lbl = ctk.CTkLabel(row_frame, text=title[:26], width=175, anchor="w",
                               font=self._font_title)
         t_lbl.pack(side="left", padx=PAD, pady=8)
 
+        # Location
         loc_raw = row.get("location", "")
-        loc_str = "" if (not loc_raw or str(loc_raw).lower() in ("nan", "none", "")) else str(loc_raw)[:18]
-        l_lbl = ctk.CTkLabel(row_frame, text=loc_str, width=120, anchor="w",
+        loc_str = "" if (not loc_raw or str(loc_raw).lower() in ("nan", "none", "")) else str(loc_raw)[:16]
+        l_lbl = ctk.CTkLabel(row_frame, text=loc_str, width=110, anchor="w",
                               font=self._font_small, text_color="#8b949e")
         l_lbl.pack(side="left", padx=PAD, pady=8)
 
-        site_raw = str(row.get("site", ""))
-        site_display = site_raw.title() if site_raw.lower() not in ("nan", "none", "") else "Web"
-        s_lbl = ctk.CTkLabel(row_frame, text=site_display, width=90, anchor="w",
-                              font=self._font_small, text_color="#58a6ff")
-        s_lbl.pack(side="left", padx=PAD, pady=8)
-
-        try:
-            match_pct = int(row.get("skills_match_pct", 0))
-            match_color = "#238636" if match_pct >= 70 else "#d29922" if match_pct >= 45 else "#da3633"
-            match_text = f"{match_pct}%"
-        except (ValueError, TypeError):
-            match_color = "#8b949e"
-            match_text = "N/A"
-        m_lbl = ctk.CTkLabel(row_frame, text=match_text, width=65, anchor="w",
-                              font=self._font_match, text_color=match_color)
-        m_lbl.pack(side="left", padx=PAD, pady=8)
-
-        v_lbl = ctk.CTkLabel(row_frame, text=f"● {verdict.upper()}" if verdict else "● N/A",
-                              width=80, anchor="w", font=self._font_verdict, text_color=v_color)
-        v_lbl.pack(side="left", padx=PAD, pady=8)
-
-        # Applied Date — fall back to posted_date for older rows that predate the column
-        applied_raw = row.get("applied_date", row.get("posted_date", ""))
+        # Applied Date
+        applied_raw = row.get("applied_date", "")
         date_str = "" if (not applied_raw or str(applied_raw).lower() in ("nan", "none", "nat")) else str(applied_raw)[:10]
-        d_lbl = ctk.CTkLabel(row_frame, text=date_str, width=110, anchor="w",
+        d_lbl = ctk.CTkLabel(row_frame, text=date_str, width=95, anchor="w",
                               font=self._font_small, text_color="#3fb950")
         d_lbl.pack(side="left", padx=PAD, pady=8)
 
-        for widget in [c_lbl, t_lbl, l_lbl, s_lbl, m_lbl, v_lbl, d_lbl, row_frame]:
+        # ATS Score
+        try:
+            score_val  = int(row.get("ats_score", 0))
+            score_clr  = "#3fb950" if score_val >= 85 else "#d29922" if score_val >= 70 else "#da3633"
+            score_text = f"{score_val}%"
+        except (ValueError, TypeError):
+            score_clr  = "#8b949e"
+            score_text = "N/A"
+        s_lbl = ctk.CTkLabel(row_frame, text=score_text, width=65, anchor="w",
+                              font=self._font_match, text_color=score_clr)
+        s_lbl.pack(side="left", padx=PAD, pady=8)
+
+        # Status
+        st_lbl = ctk.CTkLabel(row_frame, text=status_raw.upper()[:8], width=75, anchor="w",
+                               font=self._font_verdict, text_color=status_color)
+        st_lbl.pack(side="left", padx=PAD, pady=8)
+
+        # Action buttons (Compile | View .tex | Delete)
+        act_frame = ctk.CTkFrame(row_frame, fg_color="transparent", width=225)
+        act_frame.pack(side="left", padx=(6, 4), pady=5)
+        act_frame.pack_propagate(False)
+
+        applied_excel = self.config.get("pipeline", "applied_excel_path", default="Job-Tracker.xlsx")
+        applied_db    = self.config.get("pipeline", "applied_db_path",    default="applied.db")
+
+        ctk.CTkButton(act_frame, text="Compile PDF", width=82, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color="#0d3042", hover_color="#1455a4",
+                      command=lambda jid=job_id, c=company, t=title, adb=applied_db:
+                          self._compile_pdf(jid, c, t, adb)
+                      ).pack(side="left", padx=(0, 3))
+
+        ctk.CTkButton(act_frame, text="View .tex", width=70, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color="#1a2a1a", hover_color="#1e4d1e",
+                      command=lambda jid=job_id, c=company, t=title, adb=applied_db:
+                          self._view_tex(jid, c, t, adb)
+                      ).pack(side="left", padx=(0, 3))
+
+        ctk.CTkButton(act_frame, text="Delete", width=60, height=26,
+                      font=ctk.CTkFont(size=10),
+                      fg_color="#3a1010", hover_color="#6a1010",
+                      command=lambda jid=job_id, c=company, t=title, adb=applied_db, ae=applied_excel:
+                          self._delete_applied(jid, c, t, adb, ae)
+                      ).pack(side="left")
+
+        for widget in [c_lbl, t_lbl, l_lbl, d_lbl, s_lbl, st_lbl, row_frame]:
             widget.bind("<Button-1>", lambda e, r=row: self._open_detail(r))
 
     def _open_detail(self, row):
         AppliedDetailWindow(self, row.to_dict(), config=self.config)
+
+    # ── Action handlers ───────────────────────────────────────────────────────
+
+    def _compile_pdf(self, job_id: int, company: str, title: str, applied_db_path: str):
+        from db_manager import AppliedDB
+        import threading
+        db  = AppliedDB(applied_db_path)
+        tex = db.get_tex(job_id)
+        if not tex:
+            messagebox.showwarning("No LaTeX",
+                f"No .tex content stored for:\n{title} @ {company}\n\n"
+                "Only resumes generated by the pipeline have stored LaTeX.")
+            return
+
+        safe_co = re.sub(r"[^\w\s-]", "", company).strip().replace(" ", "_")[:40]
+        safe_ti = re.sub(r"[^\w\s-]", "", title  ).strip().replace(" ", "_")[:40]
+        out_dir = os.path.join("compiled", safe_co, safe_ti)
+        os.makedirs(out_dir, exist_ok=True)
+        pdf_path = os.path.join(out_dir, "Resume.pdf")
+
+        def _do():
+            try:
+                from utils.latex_compiler import compile_latex_to_pdf
+                ok = compile_latex_to_pdf(tex, pdf_path)
+                if ok:
+                    messagebox.showinfo("Compiled!", f"PDF saved:\n{os.path.abspath(pdf_path)}")
+                else:
+                    messagebox.showerror("Compile Failed",
+                        "pdflatex returned an error. Make sure pdflatex is installed.")
+            except Exception as e:
+                messagebox.showerror("Compile Error", str(e))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _view_tex(self, job_id: int, company: str, title: str, applied_db_path: str):
+        from db_manager import AppliedDB
+        db  = AppliedDB(applied_db_path)
+        tex = db.get_tex(job_id)
+        if not tex:
+            messagebox.showwarning("No LaTeX",
+                f"No .tex content stored for:\n{title} @ {company}")
+            return
+
+        win = ctk.CTkToplevel(self)
+        win.title(f".tex — {title} @ {company}")
+        win.geometry("920x620")
+        win.grab_set()
+
+        top = ctk.CTkFrame(win, fg_color="transparent")
+        top.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkLabel(top, text=f"{title} @ {company}",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
+        ctk.CTkButton(top, text="Copy All", width=80, height=26,
+                      command=lambda: [win.clipboard_clear(),
+                                       win.clipboard_append(tex),
+                                       win.update()]
+                      ).pack(side="right")
+
+        tb = ctk.CTkTextbox(win, wrap="none",
+                            font=ctk.CTkFont(family="Courier New", size=11))
+        tb.pack(fill="both", expand=True, padx=10, pady=8)
+        tb.insert("end", tex)
+        tb.configure(state="disabled")
+
+    def _delete_applied(self, job_id: int, company: str, title: str,
+                        applied_db_path: str, applied_excel: str):
+        from db_manager import AppliedDB
+        if not messagebox.askyesno("Delete",
+                f"Remove from applied tracker:\n{title} @ {company}?"):
+            return
+        db = AppliedDB(applied_db_path)
+        db.delete_by_id(job_id)
+        db.sync_to_excel(applied_excel)
+        self._load(reload=True)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -4228,6 +6059,7 @@ class JobHunterApp(ctk.CTk):
         nav_items = [
             ("Dashboard",       "🏠"),
             ("Scraper",         "🔍"),
+            ("Screener",        "🎯"),
             ("Pipeline",        "⚙"),
             ("Job Tracker",     "📊"),
             ("Applied",         "✅"),
@@ -4263,6 +6095,7 @@ class JobHunterApp(ctk.CTk):
         self._tab_factories = {
             "Dashboard":       lambda: DashboardTab(self.content, self.config),
             "Scraper":         lambda: ScraperTab(self.content, self.config, self.log_queue),
+            "Screener":        lambda: ScreenerConfigTab(self.content, self.config),
             "Pipeline":        lambda: PipelineTab(self.content, self.config, self.log_queue),
             "Job Tracker":     lambda: JobTrackerTab(self.content, self.config),
             "Applied":         lambda: AppliedTab(self.content, self.config),

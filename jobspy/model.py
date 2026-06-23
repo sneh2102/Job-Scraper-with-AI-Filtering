@@ -286,8 +286,9 @@ class Site(Enum):
     GOOGLE = "google"
     BAYT = "bayt"
     NAUKRI = "naukri"
-    BDJOBS = "bdjobs"  # Add this line
-    JOBRIGHT     = "jobright"   # ← ADD THIS
+    BDJOBS = "bdjobs"
+    JOBRIGHT = "jobright"
+    WELLFOUND = "wellfound"
 
 class SalarySource(Enum):
     DIRECT_DATA = "direct_data"

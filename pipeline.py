@@ -14,10 +14,11 @@ import json
 import logging
 import time
 import pandas as pd
+from datetime import datetime
 
 from agents.api_client import RotatingOllamaClient
 from agents.resume_builder import ResumeBuilderAgent
-from agents.ats_checker import ATSCheckerAgent
+from agents.hiring_agent_ats import HiringAgentATSChecker
 from utils.latex_compiler import (
     compile_latex_to_pdf,
     save_cover_letter_pdf,
@@ -200,13 +201,14 @@ def _reassemble_latex(body: dict) -> str:
 # ══════════════════════════════════════════════════════════════
 
 def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_location=True, default_location="Canada",
-                max_iterations: int = None, pass_threshold: int = None):
+                max_iterations: int = None, pass_threshold: int = None, event_queue=None):
     _max_iter  = max_iterations if max_iterations is not None else MAX_ATS_ITERATIONS
     _threshold = pass_threshold if pass_threshold is not None else ATS_PASS_THRESHOLD
 
-    best_score     = 0
-    no_improve     = 0
-    MAX_NO_IMPROVE = 2
+    best_score       = 0
+    no_improve       = 0
+    MAX_NO_IMPROVE   = 2
+    sections_rebuilt = []
 
     company     = str(row.get("company",     "Unknown_Company"))
     title       = str(row.get("title",       "Unknown_Position"))
@@ -251,6 +253,17 @@ def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_locatio
 
             if ats_result.get("missing_keywords"):
                 logger.info("Missing: %s", ", ".join(ats_result["missing_keywords"][:8]))
+
+            if event_queue:
+                event_queue.put(("pipeline_event", "ats_score", {
+                    "company":             company,
+                    "title":               title,
+                    "score":               final_score,
+                    "iteration":           iteration,
+                    "max_iter":            _max_iter,
+                    "pass":                bool(ats_result.get("pass") or final_score >= _threshold),
+                    "sections_to_rewrite": ats_result.get("sections_to_rewrite", []),
+                }))
 
             if ats_result.get("pass") or final_score >= _threshold:
                 logger.info("✅ ATS passed with score %d", final_score)
@@ -302,6 +315,8 @@ def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_locatio
 
                 if new_section.strip():
                     body[body_key] = new_section
+                    if section not in sections_rebuilt:
+                        sections_rebuilt.append(section)
                 else:
                     logger.warning("Rebuild of '%s' returned empty — keeping original", section)
 
@@ -314,7 +329,8 @@ def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_locatio
 
     if not latex:
         return {"company": company, "title": title, "score": 0, "status": "failed",
-                "resume_path": "", "cover_path": ""}
+                "resume_path": "", "cover_path": "", "sections_rebuilt": [],
+                "latex": "", "cover_letter": ""}
 
     resume_name = os.getenv("RESUME_FILENAME",       "Resume")
     cover_name  = os.getenv("COVER_LETTER_FILENAME", "Cover_Letter")
@@ -332,12 +348,15 @@ def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_locatio
     cover_ok  = save_cover_letter_pdf(cover_letter, cover_pdf_path)
 
     return {
-        "company":     company,
-        "title":       title,
-        "score":       final_score,
-        "status":      "done" if resume_ok else "tex_only",
-        "resume_path": resume_pdf_path if resume_ok else tex_path,
-        "cover_path":  cover_pdf_path  if cover_ok  else cover_pdf_path.replace(".pdf", ".txt"),
+        "company":          company,
+        "title":            title,
+        "score":            final_score,
+        "status":           "done" if resume_ok else "tex_only",
+        "resume_path":      resume_pdf_path if resume_ok else tex_path,
+        "cover_path":       cover_pdf_path  if cover_ok  else cover_pdf_path.replace(".pdf", ".txt"),
+        "sections_rebuilt": sections_rebuilt,
+        "latex":            latex,
+        "cover_letter":     cover_letter,
     }
 
 
@@ -345,7 +364,7 @@ def process_job(row, builder, checker, output_base, use_pdflatex, use_jd_locatio
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
-def main(stop_event=None):
+def main(stop_event=None, event_queue=None):
     global MAX_ATS_ITERATIONS, ATS_PASS_THRESHOLD
 
     load_env(".env")
@@ -388,7 +407,7 @@ def main(stop_event=None):
     projects_text   = load_text_file(projects_path, "projects")
 
     builder = ResumeBuilderAgent(client, projects_text, existing_resume)
-    checker = ATSCheckerAgent(client)
+    checker = HiringAgentATSChecker(client)
 
     use_pdflatex = is_pdflatex_available()
     if not use_pdflatex:
@@ -402,19 +421,62 @@ def main(stop_event=None):
         logger.info("Nothing to process.")
         return
 
+    if event_queue:
+        event_queue.put(("pipeline_event", "job_list", {
+            "jobs": [
+                {"company": str(r.get("company", "")), "title": str(r.get("title", ""))}
+                for _, r in yes_jobs.iterrows()
+            ]
+        }))
+
     results = []
     for idx, row in yes_jobs.iterrows():
         if stop_event and stop_event.is_set():
             logger.info("🛑 Pipeline stopped by user.")
             break
         try:
+            if event_queue:
+                event_queue.put(("pipeline_event", "job_start", {
+                    "company": str(row.get("company", "")),
+                    "title":   str(row.get("title",   "")),
+                    "index":   int(idx) + 1,
+                    "total":   len(yes_jobs),
+                }))
             result = process_job(
-                row, builder, checker, output_dir, use_pdflatex, use_jd_location=pipe_cfg.get("use_jd_location", True), 
-                default_location=pipe_cfg.get("default_location", "Canada"),                max_iterations=max_iterations,
-                pass_threshold=pass_threshold,
+                row, builder, checker, output_dir, use_pdflatex, use_jd_location=pipe_cfg.get("use_jd_location", True),
+                default_location=pipe_cfg.get("default_location", "Canada"), max_iterations=max_iterations,
+                pass_threshold=pass_threshold, event_queue=event_queue,
             )
             result["job_url"]  = str(row.get("link",     ""))
             result["location"] = str(row.get("location", ""))
+
+            # ── Persist to applied.db ─────────────────────────────────
+            if result.get("status") in ("done", "tex_only"):
+                try:
+                    from db_manager import AppliedDB
+                    adb = AppliedDB(pipe_cfg.get("applied_db_path", "applied.db"))
+                    adb.add({
+                        "company":              result.get("company", ""),
+                        "title":                result.get("title", ""),
+                        "job_url":              result.get("job_url", ""),
+                        "location":             result.get("location", ""),
+                        "applied_date":         datetime.now().strftime("%Y-%m-%d"),
+                        "ats_score":            int(result.get("score", 0)),
+                        "status":               result.get("status", "done"),
+                        "tex_content":          result.get("latex", ""),
+                        "cover_letter_content": result.get("cover_letter", ""),
+                        "resume_path":          result.get("resume_path", ""),
+                        "cover_path":           result.get("cover_path", ""),
+                    })
+                    applied_excel = pipe_cfg.get("applied_excel_path", "Job-Tracker.xlsx")
+                    adb.sync_to_excel(applied_excel)
+                    logger.info("Saved to applied.db — %s @ %s (score=%d)",
+                                result["title"], result["company"], result.get("score", 0))
+                except Exception as _db_err:
+                    logger.warning("Could not save to applied.db: %s", _db_err)
+
+            if event_queue:
+                event_queue.put(("pipeline_event", "job_done", result))
             results.append(result)
             logger.info("[%d/%d] %s @ %s | Score: %s | Status: %s",
                         idx + 1, len(yes_jobs),
@@ -422,11 +484,14 @@ def main(stop_event=None):
                         result["score"], result["status"])
         except Exception as e:
             logger.error("Unhandled error on job %d: %s", idx, e)
-            results.append({
+            err_result = {
                 "company": row.get("company", ""),
                 "title":   row.get("title",   ""),
-                "score":   0, "status": "error",
-            })
+                "score":   0, "status": "error", "sections_rebuilt": [],
+            }
+            results.append(err_result)
+            if event_queue:
+                event_queue.put(("pipeline_event", "job_done", err_result))
         time.sleep(1)
 
     logger.info("=" * 60)
